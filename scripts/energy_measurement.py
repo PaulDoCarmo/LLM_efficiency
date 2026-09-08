@@ -32,6 +32,7 @@ from __future__ import annotations
 
 import datetime as dt
 import json
+import os
 import subprocess
 import sys
 import time
@@ -60,14 +61,15 @@ def list_gpu_indices() -> list[int]:
     return [int(line.strip()) for line in result.stdout.strip().splitlines() if line.strip()]
 
 
-def gpu_processes(gpu_index: int) -> list[str]:
-    """Liste des process trouvés sur ce GPU (vide = libre)."""
+def gpu_processes(gpu_index: int, exclude_pid: int) -> list[str]:
+    """Liste des process trouvés sur ce GPU, hors notre propre process (vide = libre)."""
     result = subprocess.run(
         ["nvidia-smi", "--id", str(gpu_index),
          "--query-compute-apps=pid,process_name,used_memory", "--format=csv,noheader"],
         capture_output=True, text=True, check=True,
     )
-    return [line for line in result.stdout.strip().splitlines() if line.strip()]
+    lines = [line for line in result.stdout.strip().splitlines() if line.strip()]
+    return [line for line in lines if not line.strip().startswith(f"{exclude_pid},")]
 
 
 def check_gpu_ready(gpu_index: int) -> None:
@@ -78,7 +80,9 @@ def check_gpu_ready(gpu_index: int) -> None:
     if gpu_index not in all_indices:
         sys.exit(f"GPU {gpu_index} inexistant sur cette machine — GPU détectés : {all_indices}.")
 
-    procs = gpu_processes(gpu_index)
+    # On a potentiellement déjà chargé un modèle sur ce GPU avant d'arriver ici
+    # (chauffe), donc notre propre PID peut déjà apparaître dans la liste.
+    procs = gpu_processes(gpu_index, exclude_pid=os.getpid())
     if procs:
         details = "\n".join(procs)
         sys.exit(f"GPU {gpu_index} déjà utilisé par un autre processus, mesure impossible :\n{details}")
