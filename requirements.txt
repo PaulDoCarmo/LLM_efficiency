@@ -3,3 +3,5 @@ transformers>=4.44
 datasets>=2.19
 accelerate>=0.33
 bitsandbytes>=0.43
+numpy>=1.26
+pandas>=2.2
