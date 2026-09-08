@@ -22,6 +22,10 @@ from power_sampler import PowerSampler
 WARMUP_SECONDS = 5.0
 SAMPLER_STARTUP_DELAY_S = 0.3
 
+# Sur la DGX Station de l'équipe, l'index 3 est un GPU d'affichage
+# ("NVIDIA DGX Display"), pas une carte de calcul A100 — voir CLAUDE.md.
+FORBIDDEN_GPU_INDICES = {3}
+
 
 def build_dummy_model(hidden_size: int, n_layers: int) -> torch.nn.Module:
     layers = []
@@ -59,6 +63,9 @@ def main() -> None:
 
     if not torch.cuda.is_available():
         sys.exit("CUDA indisponible : ce script doit tourner sur la machine GPU cible.")
+
+    if args.gpu_index in FORBIDDEN_GPU_INDICES:
+        sys.exit(f"GPU {args.gpu_index} interdit (carte d'affichage, pas de calcul) — utiliser 0, 1, 2 ou 4.")
 
     device = torch.device(f"cuda:{args.gpu_index}")
     torch.cuda.set_device(device)
