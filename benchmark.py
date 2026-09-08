@@ -1,8 +1,10 @@
 #!/usr/bin/env python
-"""Compare un LLM en fp32 / fp16 / int8 / 4bit : perplexité, VRAM, débit.
+"""Compare un LLM en fp32 / fp16 / int8 / 4bit : VRAM, débit, et en option
+perplexité / IFEval.
 
-Perplexité calculée sur WikiText-2 (test). VRAM = pic alloué. tok/s = génération
-greedy de 128 tokens. Pensé pour un GPU Ampere+ (testé sur A100-40GB).
+VRAM = pic alloué. tok/s = génération greedy de 128 tokens. Perplexité (--ppl,
+désactivée par défaut) calculée sur WikiText-2 (test). Pensé pour un GPU
+Ampere+ (testé sur A100-40GB).
 
 Si plusieurs GPUs sont visibles (CUDA_VISIBLE_DEVICES ou --gpus) et plusieurs
 variantes demandées, chaque variante tourne dans son propre sous-process,
@@ -13,6 +15,8 @@ Usage:
     python benchmark.py --model Qwen/Qwen2.5-1.5B
     python benchmark.py --model meta-llama/Llama-3.2-1B --variants fp16 4bit --max-tokens 4000
     CUDA_VISIBLE_DEVICES=0,1,2,4 python benchmark.py   # 4 variantes en parallèle, une par GPU
+    python benchmark.py --ifeval --ifeval-limit 40     # + score IFEval (sous-échantillonné)
+    python benchmark.py --ppl                          # + perplexité WikiText-2
 """
 import argparse
 import json
@@ -82,16 +86,42 @@ def throughput(model, tok, n=128):
     return (out.size(1) - ids.size(1)) / (time.time() - t0)
 
 
-def run_variant(model_name, variant, max_tokens, gen_tokens):
-    """Charge tokenizer+dataset+modèle et évalue UNE variante. Suppose que
+def _extract_metric(metrics, name):
+    """lm-eval préfixe les clés avec le nom du filtre (ex: 'prompt_level_strict_acc,none')."""
+    for k, v in metrics.items():
+        if k.split(",")[0] == name:
+            return v
+    return None
+
+
+def run_ifeval(model, tok, limit=None, batch_size=4):
+    """Évalue IFEval (instruction-following) sur le modèle déjà chargé, via
+    lm-evaluation-harness. Import différé : lm_eval reste optionnel tant
+    qu'on ne passe pas --ifeval."""
+    import logging
+
+    from lm_eval import simple_evaluate
+    from lm_eval.models.huggingface import HFLM
+
+    logging.getLogger("lm-eval").setLevel(logging.WARNING)
+    lm = HFLM(pretrained=model, tokenizer=tok, batch_size=batch_size)
+    out = simple_evaluate(model=lm, tasks=["ifeval"], limit=limit, bootstrap_iters=0)
+    return out["results"]["ifeval"]
+
+
+def run_variant(
+    model_name,
+    variant,
+    max_tokens,
+    gen_tokens,
+    compute_ppl=False,
+    ifeval=False,
+    ifeval_limit=None,
+    ifeval_batch_size=4,
+):
+    """Charge tokenizer+modèle et évalue UNE variante. Suppose que
     CUDA_VISIBLE_DEVICES est déjà positionné correctement par l'appelant."""
     tok = AutoTokenizer.from_pretrained(model_name)
-    text = "\n\n".join(
-        load_dataset("Salesforce/wikitext", "wikitext-2-raw-v1", split="test")["text"]
-    )
-    enc = tok(text, return_tensors="pt")
-    if max_tokens:
-        enc.input_ids = enc.input_ids[:, :max_tokens]
 
     cfg = build_configs([variant])[variant]
     torch.cuda.empty_cache()
@@ -100,12 +130,29 @@ def run_variant(model_name, variant, max_tokens, gen_tokens):
     model.eval()
 
     tps = throughput(model, tok, gen_tokens)
-    ppl = perplexity(model, enc)
-    vram = torch.cuda.max_memory_allocated() / 1e9
+
+    result = {"variant": variant, "tok_s": tps}
+
+    if compute_ppl:
+        text = "\n\n".join(
+            load_dataset("Salesforce/wikitext", "wikitext-2-raw-v1", split="test")["text"]
+        )
+        enc = tok(text, return_tensors="pt")
+        if max_tokens:
+            enc.input_ids = enc.input_ids[:, :max_tokens]
+        result["ppl"] = perplexity(model, enc)
+
+    if ifeval:
+        ifeval_metrics = run_ifeval(model, tok, limit=ifeval_limit, batch_size=ifeval_batch_size)
+        result["ifeval"] = ifeval_metrics
+        result["ifeval_score"] = _extract_metric(ifeval_metrics, "prompt_level_strict_acc")
+
+    # Mesuré en dernier : capture le pic mémoire de toute l'évaluation (ppl + tok/s + ifeval).
+    result["vram_gb"] = torch.cuda.max_memory_allocated() / 1e9
 
     del model
     torch.cuda.empty_cache()
-    return {"variant": variant, "ppl": ppl, "vram_gb": vram, "tok_s": tps}
+    return result
 
 
 def gpu_list_from_env():
@@ -117,7 +164,19 @@ def gpu_list_from_env():
     return []
 
 
-def run_variant_subprocess(model_name, variant, max_tokens, gen_tokens, gpu_id, result_path, log_path):
+def run_variant_subprocess(
+    model_name,
+    variant,
+    max_tokens,
+    gen_tokens,
+    gpu_id,
+    result_path,
+    log_path,
+    compute_ppl=False,
+    ifeval=False,
+    ifeval_limit=None,
+    ifeval_batch_size=4,
+):
     env = os.environ.copy()
     env["CUDA_VISIBLE_DEVICES"] = gpu_id
     cmd = [
@@ -129,6 +188,14 @@ def run_variant_subprocess(model_name, variant, max_tokens, gen_tokens, gpu_id, 
         "--worker-variant", variant,
         "--result-file", str(result_path),
     ]
+    if compute_ppl:
+        cmd.append("--ppl")
+    if ifeval:
+        cmd.append("--ifeval")
+        if ifeval_limit is not None:
+            cmd += ["--ifeval-limit", str(ifeval_limit)]
+        cmd += ["--ifeval-batch-size", str(ifeval_batch_size)]
+
     print(f"[{variant}] démarré sur GPU {gpu_id}", flush=True)
     with open(log_path, "w", encoding="utf-8") as log:
         proc = subprocess.run(cmd, env=env, stdout=log, stderr=subprocess.STDOUT)
@@ -140,15 +207,32 @@ def run_variant_subprocess(model_name, variant, max_tokens, gen_tokens, gpu_id, 
         result = json.load(f)
     result["gpu"] = gpu_id
     result_path.unlink(missing_ok=True)
+    extra = ""
+    if result.get("ppl") is not None:
+        extra += f" ppl={result['ppl']:.3f}"
+    if result.get("ifeval_score") is not None:
+        extra += f" ifeval={result['ifeval_score'] * 100:.1f}%"
     print(
         f"[{variant}] terminé sur GPU {gpu_id} : "
-        f"ppl={result['ppl']:.3f} vram={result['vram_gb']:.2f}GB tok/s={result['tok_s']:.1f}",
+        f"vram={result['vram_gb']:.2f}GB tok/s={result['tok_s']:.1f}{extra}",
         flush=True,
     )
     return result
 
 
-def run_parallel(model_name, variants, max_tokens, gen_tokens, gpus, tmp_dir, log_dir):
+def run_parallel(
+    model_name,
+    variants,
+    max_tokens,
+    gen_tokens,
+    gpus,
+    tmp_dir,
+    log_dir,
+    compute_ppl=False,
+    ifeval=False,
+    ifeval_limit=None,
+    ifeval_batch_size=4,
+):
     gpu_queue: Queue = Queue()
     for g in gpus:
         gpu_queue.put(g)
@@ -159,7 +243,17 @@ def run_parallel(model_name, variants, max_tokens, gen_tokens, gpus, tmp_dir, lo
             result_path = tmp_dir / f"{variant}.json"
             log_path = log_dir / f"{variant}.log"
             return run_variant_subprocess(
-                model_name, variant, max_tokens, gen_tokens, gpu_id, result_path, log_path
+                model_name,
+                variant,
+                max_tokens,
+                gen_tokens,
+                gpu_id,
+                result_path,
+                log_path,
+                compute_ppl=compute_ppl,
+                ifeval=ifeval,
+                ifeval_limit=ifeval_limit,
+                ifeval_batch_size=ifeval_batch_size,
             )
         finally:
             gpu_queue.put(gpu_id)
@@ -168,18 +262,25 @@ def run_parallel(model_name, variants, max_tokens, gen_tokens, gpus, tmp_dir, lo
         return list(ex.map(worker, variants))
 
 
-def print_table(results):
-    print(f"\n{'variant':8} {'ppl':>9} {'VRAM_GB':>9} {'tok/s':>8}   gpu")
-    print("-" * 46)
+def print_table(results, ifeval=False):
+    header = f"\n{'variant':8} {'ppl':>9} {'VRAM_GB':>9} {'tok/s':>8}"
+    if ifeval:
+        header += f" {'ifeval':>8}"
+    header += "   gpu"
+    print(header)
+    print("-" * (len(header) + 4))
     lines = []
     for r in results:
         if "error" in r:
             line = f"{r['variant']:8} {'ERREUR':>9}   {r['error']}"
         else:
-            line = (
-                f"{r['variant']:8} {r['ppl']:9.3f} {r['vram_gb']:9.2f} "
-                f"{r['tok_s']:8.1f}   {r.get('gpu', '-')}"
-            )
+            ppl = r.get("ppl")
+            ppl_str = f"{ppl:9.3f}" if ppl is not None else f"{'n/a':>9}"
+            line = f"{r['variant']:8} {ppl_str} {r['vram_gb']:9.2f} {r['tok_s']:8.1f}"
+            if ifeval:
+                score = r.get("ifeval_score")
+                line += f" {score * 100:7.1f}%" if score is not None else f" {'n/a':>8}"
+            line += f"   {r.get('gpu', '-')}"
         print(line)
         lines.append(line)
     return lines
@@ -215,6 +316,30 @@ def main():
         "--out",
         help="Fichier de résultats JSON. Défaut: results/<model>_<timestamp>.json",
     )
+    ap.add_argument(
+        "--ppl",
+        dest="compute_ppl",
+        action="store_true",
+        help="Calcule la perplexité sur WikiText-2 (désactivé par défaut, mis de côté pour l'instant).",
+    )
+    ap.add_argument(
+        "--ifeval",
+        action="store_true",
+        help="Évalue aussi IFEval (instruction-following) via lm-evaluation-harness, "
+        "en plus de ppl/VRAM/tok-s. Nécessite lm-eval[ifeval] (voir requirements.txt).",
+    )
+    ap.add_argument(
+        "--ifeval-limit",
+        type=int,
+        default=None,
+        help="Limite le nombre d'exemples IFEval (défaut: tous, 541 prompts, lent).",
+    )
+    ap.add_argument(
+        "--ifeval-batch-size",
+        type=int,
+        default=4,
+        help="Batch size pour l'évaluation IFEval.",
+    )
     # Flags internes utilisés par les sous-process workers, cachés du --help.
     ap.add_argument("--worker-variant", dest="worker_variant", help=argparse.SUPPRESS)
     ap.add_argument("--result-file", dest="result_file", help=argparse.SUPPRESS)
@@ -225,7 +350,16 @@ def main():
 
     # Mode worker : évalue une seule variante, écrit le résultat en JSON, puis quitte.
     if args.worker_variant:
-        result = run_variant(args.model, args.worker_variant, args.max_tokens, args.gen_tokens)
+        result = run_variant(
+            args.model,
+            args.worker_variant,
+            args.max_tokens,
+            args.gen_tokens,
+            compute_ppl=args.compute_ppl,
+            ifeval=args.ifeval,
+            ifeval_limit=args.ifeval_limit,
+            ifeval_batch_size=args.ifeval_batch_size,
+        )
         with open(args.result_file, "w", encoding="utf-8") as f:
             json.dump(result, f)
         return
@@ -247,14 +381,34 @@ def main():
         log_dir.mkdir(exist_ok=True)
         try:
             results = run_parallel(
-                args.model, args.variants, args.max_tokens, args.gen_tokens, gpus, tmp_dir, log_dir
+                args.model,
+                args.variants,
+                args.max_tokens,
+                args.gen_tokens,
+                gpus,
+                tmp_dir,
+                log_dir,
+                compute_ppl=args.compute_ppl,
+                ifeval=args.ifeval,
+                ifeval_limit=args.ifeval_limit,
+                ifeval_batch_size=args.ifeval_batch_size,
             )
         finally:
             shutil.rmtree(tmp_dir, ignore_errors=True)
     else:
         print(f"device = {torch.cuda.get_device_name()}   (exécution séquentielle)")
         results = [
-            run_variant(args.model, v, args.max_tokens, args.gen_tokens) for v in args.variants
+            run_variant(
+                args.model,
+                v,
+                args.max_tokens,
+                args.gen_tokens,
+                compute_ppl=args.compute_ppl,
+                ifeval=args.ifeval,
+                ifeval_limit=args.ifeval_limit,
+                ifeval_batch_size=args.ifeval_batch_size,
+            )
+            for v in args.variants
         ]
 
     elapsed = time.time() - t0
@@ -263,7 +417,7 @@ def main():
     order = {v: i for i, v in enumerate(args.variants)}
     results.sort(key=lambda r: order.get(r["variant"], 999))
 
-    table_lines = print_table(results)
+    table_lines = print_table(results, ifeval=args.ifeval)
     print(f"\ntemps total: {elapsed:.1f}s")
 
     out_path = (
@@ -281,6 +435,9 @@ def main():
                 "gen_tokens": args.gen_tokens,
                 "parallel": parallel,
                 "gpus": gpus,
+                "compute_ppl": args.compute_ppl,
+                "ifeval": args.ifeval,
+                "ifeval_limit": args.ifeval_limit,
                 "elapsed_s": elapsed,
                 "results": results,
                 "table": "\n".join(table_lines),
