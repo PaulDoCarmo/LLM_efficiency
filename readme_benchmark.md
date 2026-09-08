@@ -1,6 +1,6 @@
 # quant-bench
 
-Compare un même LLM en **fp32 / fp16 / int8 / 4bit** sur VRAM (pic alloué),
+Compare un même LLM en **fp16 / bf16 / int8 / 4bit** sur VRAM (pic alloué),
 débit (tokens/s) et **énergie consommée** (via
 [`energy_measurement`](energy_measurement/README.md), activée par défaut),
 avec en option la perplexité (WikiText-2) et IFEval (instruction-following,
@@ -56,7 +56,7 @@ Voir [Parallélisation](#parallélisation-multi-gpu) plus bas.
 | Flag | Défaut | Effet |
 |---|---|---|
 | `--model` | `Qwen/Qwen2.5-1.5B` | Modèle HF à évaluer |
-| `--variants` | les 4 | Sous-ensemble parmi `fp32 fp16 int8 4bit` |
+| `--variants` | les 4 | Sous-ensemble parmi `fp16 bf16 int8 4bit` |
 | `--ppl` | désactivé | Calcule la perplexité sur WikiText-2 (test) |
 | `--max-tokens` | `0` (tout) | Tronque le texte d'éval ppl à N tokens |
 | `--ifeval` | désactivé | Calcule IFEval via lm-evaluation-harness |
@@ -75,8 +75,8 @@ Sortie console type (avec `--ppl --ifeval`) :
 ```
 variant        ppl   VRAM_GB    tok/s  energy_Wh   avg_W   ifeval   gpu
 ------------------------------------------------------------------------
-fp32        10.213      8.81     34.9      0.412     187     54.3%   0
-fp16        10.212      6.28     34.3      0.301     174     53.8%   1
+fp16        10.212      6.28     34.3      0.301     174     53.8%   0
+bf16        10.213      6.28     34.6      0.298     175     54.1%   1
 int8        10.278      4.97      8.6      0.256     146     52.9%   2
 4bit        11.837      4.40     24.6      0.198     139     47.5%   4
 ```
@@ -150,9 +150,13 @@ dans `energy_measurement/README.md`).
   `--ifeval` complet.
 - **fp8** n'est pas inclus : pas de tensor cores FP8 sur Ampere (Hopper/H100
   requis). En weight-only il tournerait mais sans gain de vitesse.
-- **fp32 vs fp16** : perplexité quasi identique, parfois strictement égale sur
-  un petit modèle. fp32 sert surtout de baseline « pleine précision » ; le
-  contraste net se voit surtout en 4bit.
+- **bf16 vs fp16** : Qwen (comme la plupart des LLM récents) est entraîné et
+  publié en **bf16** — c'est sa précision native, pas fp32. bf16 sert donc de
+  vraie baseline « pleine précision fidèle à l'entraînement » ; fp16 est une
+  conversion de format (mantisse réduite, mais surtout exposant plus étroit
+  que bf16/fp32), ce qui peut en théorie faire déborder des activations à
+  large dynamique. En pratique, sur un petit modèle, la perplexité des deux
+  reste quasi identique — le contraste net se voit surtout en 4bit.
 
 ## Machine(s) utilisée(s)
 
