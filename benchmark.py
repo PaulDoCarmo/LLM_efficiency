@@ -44,8 +44,12 @@ warnings.filterwarnings("ignore", message="MatMul8bitLt: inputs will be cast")
 from datasets import load_dataset
 from transformers import AutoModelForCausalLM, AutoTokenizer, BitsAndBytesConfig
 
+sys.path.insert(0, str(Path(__file__).parent / "energy_measurement"))
+from energy_measurement import EnergyMeasurement  # noqa: E402
+
 ALL_VARIANTS = ["fp32", "fp16", "int8", "4bit"]
 FORBIDDEN_GPUS = {"3"}  # GPU 3 hors limites sur cette machine, ne jamais l'utiliser.
+WARMUP_GEN_TOKENS = 8  # chauffe hors mesure, avant d'entrer dans EnergyMeasurement.
 
 
 def build_configs(selected):
@@ -109,6 +113,10 @@ def run_ifeval(model, tok, limit=None, batch_size=4):
     return out["results"]["ifeval"]
 
 
+def energy_output_dir(model_name, variant, base="results/energy"):
+    return Path(base) / model_name.replace("/", "_") / variant
+
+
 def run_variant(
     model_name,
     variant,
@@ -118,9 +126,20 @@ def run_variant(
     ifeval=False,
     ifeval_limit=None,
     ifeval_batch_size=4,
+    measure_energy=True,
+    energy_gpu_index=0,
+    energy_dir=None,
 ):
     """Charge tokenizer+modèle et évalue UNE variante. Suppose que
-    CUDA_VISIBLE_DEVICES est déjà positionné correctement par l'appelant."""
+    CUDA_VISIBLE_DEVICES est déjà positionné correctement par l'appelant.
+
+    Si measure_energy est activé, le débit (et la perplexité si demandée)
+    tournent sous EnergyMeasurement, sur `energy_gpu_index` (index PHYSIQUE
+    nvidia-smi du GPU réellement utilisé par ce process — voir le README de
+    energy_measurement/). IFEval reste hors mesure : lm-evaluation-harness
+    fait ses propres I/O (téléchargement/chargement de données) pendant
+    l'évaluation, ce qui fausserait la trace de puissance (voir
+    energy_measurement/README.md)."""
     tok = AutoTokenizer.from_pretrained(model_name)
 
     cfg = build_configs([variant])[variant]
@@ -129,18 +148,46 @@ def run_variant(
     model = AutoModelForCausalLM.from_pretrained(model_name, device_map="cuda", **cfg)
     model.eval()
 
-    tps = throughput(model, tok, gen_tokens)
-
-    result = {"variant": variant, "tok_s": tps}
-
+    # Toute I/O (chargement de données) doit être terminée avant d'entrer
+    # dans le bloc mesuré par EnergyMeasurement.
+    ppl_enc = None
     if compute_ppl:
         text = "\n\n".join(
             load_dataset("Salesforce/wikitext", "wikitext-2-raw-v1", split="test")["text"]
         )
-        enc = tok(text, return_tensors="pt")
+        ppl_enc = tok(text, return_tensors="pt")
         if max_tokens:
-            enc.input_ids = enc.input_ids[:, :max_tokens]
-        result["ppl"] = perplexity(model, enc)
+            ppl_enc.input_ids = ppl_enc.input_ids[:, :max_tokens]
+
+    # Chauffe hors mesure : le premier appel au modèle compile des kernels et
+    # alloue de la mémoire, ce qui fausserait aussi bien tok/s que la trace
+    # de puissance si on le laissait dans le bloc mesuré.
+    throughput(model, tok, WARMUP_GEN_TOKENS)
+    torch.cuda.synchronize()
+
+    result = {"variant": variant}
+
+    if measure_energy:
+        run_dir = energy_dir or energy_output_dir(model_name, variant)
+        with EnergyMeasurement(
+            gpu_index=energy_gpu_index,
+            output_dir=run_dir,
+            metadata={"model": model_name, "variant": variant, "gen_tokens": gen_tokens},
+        ) as em:
+            result["tok_s"] = throughput(model, tok, gen_tokens)
+            if compute_ppl:
+                result["ppl"] = perplexity(model, ppl_enc)
+        result["energy_j"] = em.energy_j
+        result["energy_wh"] = em.energy_j / 3600.0
+        result["mean_power_w"] = em.mean_power_w
+        result["mean_utilization_pct"] = em.mean_utilization_pct
+        result["peak_vram_mib"] = em.peak_vram_mib
+        result["mean_vram_mib"] = em.mean_vram_mib
+        result["energy_run_dir"] = str(em.run_dir)
+    else:
+        result["tok_s"] = throughput(model, tok, gen_tokens)
+        if compute_ppl:
+            result["ppl"] = perplexity(model, ppl_enc)
 
     if ifeval:
         ifeval_metrics = run_ifeval(model, tok, limit=ifeval_limit, batch_size=ifeval_batch_size)
@@ -176,6 +223,8 @@ def run_variant_subprocess(
     ifeval=False,
     ifeval_limit=None,
     ifeval_batch_size=4,
+    measure_energy=True,
+    energy_out=None,
 ):
     env = os.environ.copy()
     env["CUDA_VISIBLE_DEVICES"] = gpu_id
@@ -187,6 +236,9 @@ def run_variant_subprocess(
         "--gen-tokens", str(gen_tokens),
         "--worker-variant", variant,
         "--result-file", str(result_path),
+        # CUDA_VISIBLE_DEVICES ne réduit qu'aux yeux de torch : nvidia-smi
+        # (utilisé par EnergyMeasurement) voit toujours l'index physique.
+        "--energy-gpu-index", gpu_id,
     ]
     if compute_ppl:
         cmd.append("--ppl")
@@ -195,6 +247,10 @@ def run_variant_subprocess(
         if ifeval_limit is not None:
             cmd += ["--ifeval-limit", str(ifeval_limit)]
         cmd += ["--ifeval-batch-size", str(ifeval_batch_size)]
+    if not measure_energy:
+        cmd.append("--no-energy")
+    if energy_out:
+        cmd += ["--energy-out", str(energy_out)]
 
     print(f"[{variant}] démarré sur GPU {gpu_id}", flush=True)
     with open(log_path, "w", encoding="utf-8") as log:
@@ -210,6 +266,8 @@ def run_variant_subprocess(
     extra = ""
     if result.get("ppl") is not None:
         extra += f" ppl={result['ppl']:.3f}"
+    if result.get("energy_wh") is not None:
+        extra += f" energy={result['energy_wh']:.3f}Wh ({result['mean_power_w']:.0f}W moy.)"
     if result.get("ifeval_score") is not None:
         extra += f" ifeval={result['ifeval_score'] * 100:.1f}%"
     print(
@@ -232,6 +290,8 @@ def run_parallel(
     ifeval=False,
     ifeval_limit=None,
     ifeval_batch_size=4,
+    measure_energy=True,
+    energy_out=None,
 ):
     gpu_queue: Queue = Queue()
     for g in gpus:
@@ -254,6 +314,8 @@ def run_parallel(
                 ifeval=ifeval,
                 ifeval_limit=ifeval_limit,
                 ifeval_batch_size=ifeval_batch_size,
+                measure_energy=measure_energy,
+                energy_out=energy_out,
             )
         finally:
             gpu_queue.put(gpu_id)
@@ -263,7 +325,7 @@ def run_parallel(
 
 
 def print_table(results, ifeval=False):
-    header = f"\n{'variant':8} {'ppl':>9} {'VRAM_GB':>9} {'tok/s':>8}"
+    header = f"\n{'variant':8} {'ppl':>9} {'VRAM_GB':>9} {'tok/s':>8} {'energy_Wh':>10} {'avg_W':>7}"
     if ifeval:
         header += f" {'ifeval':>8}"
     header += "   gpu"
@@ -276,7 +338,14 @@ def print_table(results, ifeval=False):
         else:
             ppl = r.get("ppl")
             ppl_str = f"{ppl:9.3f}" if ppl is not None else f"{'n/a':>9}"
-            line = f"{r['variant']:8} {ppl_str} {r['vram_gb']:9.2f} {r['tok_s']:8.1f}"
+            energy_wh = r.get("energy_wh")
+            energy_str = f"{energy_wh:10.3f}" if energy_wh is not None else f"{'n/a':>10}"
+            avg_w = r.get("mean_power_w")
+            avg_w_str = f"{avg_w:7.0f}" if avg_w is not None else f"{'n/a':>7}"
+            line = (
+                f"{r['variant']:8} {ppl_str} {r['vram_gb']:9.2f} {r['tok_s']:8.1f} "
+                f"{energy_str} {avg_w_str}"
+            )
             if ifeval:
                 score = r.get("ifeval_score")
                 line += f" {score * 100:7.1f}%" if score is not None else f" {'n/a':>8}"
@@ -340,9 +409,30 @@ def main():
         default=4,
         help="Batch size pour l'évaluation IFEval.",
     )
+    ap.add_argument(
+        "--no-energy",
+        dest="measure_energy",
+        action="store_false",
+        help="Désactive la mesure d'énergie (activée par défaut). Utile pour itérer "
+        "vite ou si le GPU n'est pas libre pour EnergyMeasurement (voir "
+        "energy_measurement/README.md).",
+    )
+    ap.add_argument(
+        "--energy-gpu-index",
+        type=int,
+        default=None,
+        help="Index PHYSIQUE nvidia-smi du GPU à surveiller pour la mesure d'énergie "
+        "en mode séquentiel. Défaut: premier GPU de --gpus/CUDA_VISIBLE_DEVICES. "
+        "En mode parallèle chaque sous-process déduit automatiquement le sien.",
+    )
+    ap.add_argument(
+        "--energy-out",
+        help="Dossier racine des résultats d'énergie. Défaut: results/energy/<model>/<variant>/.",
+    )
     # Flags internes utilisés par les sous-process workers, cachés du --help.
     ap.add_argument("--worker-variant", dest="worker_variant", help=argparse.SUPPRESS)
     ap.add_argument("--result-file", dest="result_file", help=argparse.SUPPRESS)
+    ap.set_defaults(measure_energy=True)
     args = ap.parse_args()
 
     if not torch.cuda.is_available():
@@ -359,6 +449,9 @@ def main():
             ifeval=args.ifeval,
             ifeval_limit=args.ifeval_limit,
             ifeval_batch_size=args.ifeval_batch_size,
+            measure_energy=args.measure_energy,
+            energy_gpu_index=args.energy_gpu_index if args.energy_gpu_index is not None else 0,
+            energy_dir=Path(args.energy_out) / args.worker_variant if args.energy_out else None,
         )
         with open(args.result_file, "w", encoding="utf-8") as f:
             json.dump(result, f)
@@ -392,11 +485,24 @@ def main():
                 ifeval=args.ifeval,
                 ifeval_limit=args.ifeval_limit,
                 ifeval_batch_size=args.ifeval_batch_size,
+                measure_energy=args.measure_energy,
+                energy_out=args.energy_out,
             )
         finally:
             shutil.rmtree(tmp_dir, ignore_errors=True)
     else:
         print(f"device = {torch.cuda.get_device_name()}   (exécution séquentielle)")
+        # En séquentiel, un seul GPU physique sert réellement torch : le premier
+        # de --gpus/CUDA_VISIBLE_DEVICES (sinon --energy-gpu-index explicite).
+        seq_energy_gpu_index = (
+            args.energy_gpu_index if args.energy_gpu_index is not None
+            else int(gpus[0]) if gpus else 0
+        )
+        if args.measure_energy and len(gpus) > 1:
+            print(
+                f"ATTENTION: {len(gpus)} GPUs visibles en séquentiel, mesure d'énergie "
+                f"limitée au GPU {seq_energy_gpu_index} (--energy-gpu-index pour changer)."
+            )
         results = [
             run_variant(
                 args.model,
@@ -407,6 +513,9 @@ def main():
                 ifeval=args.ifeval,
                 ifeval_limit=args.ifeval_limit,
                 ifeval_batch_size=args.ifeval_batch_size,
+                measure_energy=args.measure_energy,
+                energy_gpu_index=seq_energy_gpu_index,
+                energy_dir=Path(args.energy_out) / v if args.energy_out else None,
             )
             for v in args.variants
         ]
@@ -438,6 +547,7 @@ def main():
                 "compute_ppl": args.compute_ppl,
                 "ifeval": args.ifeval,
                 "ifeval_limit": args.ifeval_limit,
+                "measure_energy": args.measure_energy,
                 "elapsed_s": elapsed,
                 "results": results,
                 "table": "\n".join(table_lines),

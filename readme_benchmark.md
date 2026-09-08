@@ -1,9 +1,11 @@
 # quant-bench
 
-Compare un même LLM en **fp32 / fp16 / int8 / 4bit** sur VRAM (pic alloué) et
-débit (tokens/s), avec en option la perplexité (WikiText-2) et IFEval
-(instruction-following, via `lm-evaluation-harness`). Si plusieurs GPUs sont
-visibles, les variantes tournent en parallèle, une par GPU.
+Compare un même LLM en **fp32 / fp16 / int8 / 4bit** sur VRAM (pic alloué),
+débit (tokens/s) et **énergie consommée** (via
+[`energy_measurement`](energy_measurement/README.md), activée par défaut),
+avec en option la perplexité (WikiText-2) et IFEval (instruction-following,
+via `lm-evaluation-harness`). Si plusieurs GPUs sont visibles, les variantes
+tournent en parallèle, une par GPU.
 
 ## Installation
 
@@ -35,6 +37,9 @@ python benchmark.py --model Qwen/Qwen2.5-1.5B --ifeval --ifeval-limit 40
 
 # sous-ensemble de variantes
 python benchmark.py --model meta-llama/Llama-3.2-1B --variants fp16 4bit
+
+# désactiver la mesure d'énergie (itération rapide, ou GPU non libre)
+python benchmark.py --model Qwen/Qwen2.5-1.5B --no-energy
 ```
 
 ### Multi-GPU
@@ -61,22 +66,36 @@ Voir [Parallélisation](#parallélisation-multi-gpu) plus bas.
 | `--gpus` | `CUDA_VISIBLE_DEVICES` ou tous | GPUs physiques à utiliser en parallèle |
 | `--sequential` | auto | Force l'exécution séquentielle (désactive le multi-GPU) |
 | `--out` | `results/<model>_<timestamp>.json` | Fichier de résultats |
+| `--no-energy` | désactivé (mesure activée par défaut) | Coupe la mesure d'énergie (`EnergyMeasurement`) |
+| `--energy-gpu-index` | premier GPU de `--gpus` | Index physique nvidia-smi à surveiller, en séquentiel seulement |
+| `--energy-out` | `results/energy/<model>/<variant>/` | Dossier racine des traces d'énergie |
 
 Sortie console type (avec `--ppl --ifeval`) :
 
 ```
-variant        ppl   VRAM_GB    tok/s   ifeval   gpu
-------------------------------------------------------
-fp32        10.213      8.81     34.9     54.3%   0
-fp16        10.212      6.28     34.3     53.8%   1
-int8        10.278      4.97      8.6     52.9%   2
-4bit        11.837      4.40     24.6     47.5%   4
+variant        ppl   VRAM_GB    tok/s  energy_Wh   avg_W   ifeval   gpu
+------------------------------------------------------------------------
+fp32        10.213      8.81     34.9      0.412     187     54.3%   0
+fp16        10.212      6.28     34.3      0.301     174     53.8%   1
+int8        10.278      4.97      8.6      0.256     146     52.9%   2
+4bit        11.837      4.40     24.6      0.198     139     47.5%   4
 ```
 
 ## Méthode
 
 - **VRAM** — `torch.cuda.max_memory_allocated()`, mesuré après toute
   l'évaluation de la variante (débit + ppl + IFEval si activés).
+- **Énergie** (activée par défaut, `--no-energy` pour désactiver) — chaque
+  variante charge son modèle et fait une petite génération de chauffe hors
+  mesure, puis le débit (et la perplexité si `--ppl`) tournent sous
+  [`EnergyMeasurement`](energy_measurement/README.md) : joules intégrés sur
+  la trace `nvidia-smi` réelle, watts moyens, utilisation GPU, VRAM. IFEval
+  reste **hors mesure d'énergie** : `lm-evaluation-harness` fait ses propres
+  I/O (téléchargement/chargement de données) pendant l'évaluation, ce qui
+  fausserait la trace de puissance (voir le protocole détaillé dans
+  `energy_measurement/README.md`). Chaque variante écrit sa trace dans
+  `results/energy/<model>/<variant>/<timestamp>/` (`power_trace.csv`,
+  `energy_timeseries.csv`, `summary.json`).
 - **Débit** — génération greedy de 128 tokens, `synchronize()` autour du chrono.
 - **Perplexité** (`--ppl`) — fenêtre glissante sur WikiText-2 test (stride 512,
   contexte 2048), seuls les nouveaux tokens de chaque fenêtre sont scorés.
@@ -105,6 +124,18 @@ classique dans le process principal — utile pour debug avec `--sequential`).
 elles : les 4 sous-process se partagent des ressources hôte (CPU, PCIe), ce
 qui compresse les écarts de débit réels. Pour un chiffre de débit rigoureux,
 relance avec `--sequential`.
+
+⚠️ `EnergyMeasurement` exige un GPU **libre** (aucun autre process dessus) au
+moment d'entrer dans le bloc mesuré — voir
+[energy_measurement/README.md](energy_measurement/README.md). En parallèle
+chaque sous-process cible automatiquement son propre GPU physique
+(`CUDA_VISIBLE_DEVICES` par variante), donc c'est transparent. En séquentiel
+avec plusieurs GPUs visibles, la mesure d'énergie ne surveille que le premier
+(`--energy-gpu-index` pour en choisir un autre) puisque tout tourne dans le
+même process sur un seul device à la fois. Un run court (peu de tokens, pas
+de `--ppl`) donne aussi une fenêtre de mesure très brève : la puissance
+moyenne est alors plus bruitée (voir "Bloc d'au moins 60 secondes recommandé"
+dans `energy_measurement/README.md`).
 
 ## À savoir sur l'A100
 

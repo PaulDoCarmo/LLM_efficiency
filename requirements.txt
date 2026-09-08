@@ -6,3 +6,5 @@ huggingface_hub<1.0
 accelerate>=0.33
 bitsandbytes>=0.43
 lm-eval[ifeval]>=0.4.4
+numpy
+pandas
