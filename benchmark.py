@@ -74,7 +74,7 @@ def main():
 
     tok = AutoTokenizer.from_pretrained(args.model)
     text = "\n\n".join(
-        load_dataset("wikitext", "wikitext-2-raw-v1", split="test")["text"]
+        load_dataset("Salesforce/wikitext", "wikitext-2-raw-v1", split="test")["text"]
     )
     enc = tok(text, return_tensors="pt")
     if args.max_tokens:
