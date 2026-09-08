@@ -4,19 +4,37 @@
 Perplexité calculée sur WikiText-2 (test). VRAM = pic alloué. tok/s = génération
 greedy de 128 tokens. Pensé pour un GPU Ampere+ (testé sur A100-40GB).
 
+Si plusieurs GPUs sont visibles (CUDA_VISIBLE_DEVICES ou --gpus) et plusieurs
+variantes demandées, chaque variante tourne dans son propre sous-process,
+un GPU dédié chacune, en parallèle. Sinon, exécution séquentielle classique
+dans ce process.
+
 Usage:
     python benchmark.py --model Qwen/Qwen2.5-1.5B
     python benchmark.py --model meta-llama/Llama-3.2-1B --variants fp16 4bit --max-tokens 4000
+    CUDA_VISIBLE_DEVICES=0,1,2,4 python benchmark.py   # 4 variantes en parallèle, une par GPU
 """
 import argparse
+import json
+import os
+import shutil
+import subprocess
+import sys
+import tempfile
 import time
 import warnings
+from concurrent.futures import ThreadPoolExecutor
+from datetime import datetime
+from pathlib import Path
+from queue import Queue
 
 import torch
 
 warnings.filterwarnings("ignore", message="MatMul8bitLt: inputs will be cast")
 from datasets import load_dataset
 from transformers import AutoModelForCausalLM, AutoTokenizer, BitsAndBytesConfig
+
+ALL_VARIANTS = ["fp32", "fp16", "int8", "4bit"]
 
 
 def build_configs(selected):
@@ -57,14 +75,109 @@ def throughput(model, tok, n=128):
     return (out.size(1) - ids.size(1)) / (time.time() - t0)
 
 
+def run_variant(model_name, variant, max_tokens, gen_tokens):
+    """Charge tokenizer+dataset+modèle et évalue UNE variante. Suppose que
+    CUDA_VISIBLE_DEVICES est déjà positionné correctement par l'appelant."""
+    tok = AutoTokenizer.from_pretrained(model_name)
+    text = "\n\n".join(
+        load_dataset("Salesforce/wikitext", "wikitext-2-raw-v1", split="test")["text"]
+    )
+    enc = tok(text, return_tensors="pt")
+    if max_tokens:
+        enc.input_ids = enc.input_ids[:, :max_tokens]
+
+    cfg = build_configs([variant])[variant]
+    torch.cuda.empty_cache()
+    torch.cuda.reset_peak_memory_stats()
+    model = AutoModelForCausalLM.from_pretrained(model_name, device_map="cuda", **cfg)
+    model.eval()
+
+    tps = throughput(model, tok, gen_tokens)
+    ppl = perplexity(model, enc)
+    vram = torch.cuda.max_memory_allocated() / 1e9
+
+    del model
+    torch.cuda.empty_cache()
+    return {"variant": variant, "ppl": ppl, "vram_gb": vram, "tok_s": tps}
+
+
+def gpu_list_from_env():
+    raw = os.environ.get("CUDA_VISIBLE_DEVICES", "")
+    if raw.strip():
+        return [g.strip() for g in raw.split(",") if g.strip()]
+    if torch.cuda.is_available():
+        return [str(i) for i in range(torch.cuda.device_count())]
+    return []
+
+
+def run_variant_subprocess(model_name, variant, max_tokens, gen_tokens, gpu_id, result_path, log_path):
+    env = os.environ.copy()
+    env["CUDA_VISIBLE_DEVICES"] = gpu_id
+    cmd = [
+        sys.executable,
+        os.path.abspath(__file__),
+        "--model", model_name,
+        "--max-tokens", str(max_tokens),
+        "--gen-tokens", str(gen_tokens),
+        "--worker-variant", variant,
+        "--result-file", str(result_path),
+    ]
+    with open(log_path, "w", encoding="utf-8") as log:
+        proc = subprocess.run(cmd, env=env, stdout=log, stderr=subprocess.STDOUT)
+    if proc.returncode != 0 or not result_path.exists():
+        return {"variant": variant, "error": f"échec (code {proc.returncode}), voir {log_path}"}
+    with open(result_path, encoding="utf-8") as f:
+        result = json.load(f)
+    result["gpu"] = gpu_id
+    result_path.unlink(missing_ok=True)
+    return result
+
+
+def run_parallel(model_name, variants, max_tokens, gen_tokens, gpus, tmp_dir, log_dir):
+    gpu_queue: Queue = Queue()
+    for g in gpus:
+        gpu_queue.put(g)
+
+    def worker(variant):
+        gpu_id = gpu_queue.get()
+        try:
+            result_path = tmp_dir / f"{variant}.json"
+            log_path = log_dir / f"{variant}.log"
+            return run_variant_subprocess(
+                model_name, variant, max_tokens, gen_tokens, gpu_id, result_path, log_path
+            )
+        finally:
+            gpu_queue.put(gpu_id)
+
+    with ThreadPoolExecutor(max_workers=len(gpus)) as ex:
+        return list(ex.map(worker, variants))
+
+
+def print_table(results):
+    print(f"\n{'variant':8} {'ppl':>9} {'VRAM_GB':>9} {'tok/s':>8}   gpu")
+    print("-" * 46)
+    lines = []
+    for r in results:
+        if "error" in r:
+            line = f"{r['variant']:8} {'ERREUR':>9}   {r['error']}"
+        else:
+            line = (
+                f"{r['variant']:8} {r['ppl']:9.3f} {r['vram_gb']:9.2f} "
+                f"{r['tok_s']:8.1f}   {r.get('gpu', '-')}"
+            )
+        print(line)
+        lines.append(line)
+    return lines
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--model", default="Qwen/Qwen2.5-1.5B")
     ap.add_argument(
         "--variants",
         nargs="+",
-        default=["fp32", "fp16", "int8", "4bit"],
-        choices=["fp32", "fp16", "int8", "4bit"],
+        default=ALL_VARIANTS,
+        choices=ALL_VARIANTS,
     )
     ap.add_argument(
         "--max-tokens",
@@ -73,39 +186,91 @@ def main():
         help="Tronque le texte d'éval à N tokens (0 = tout WikiText-2, ~330k, lent).",
     )
     ap.add_argument("--gen-tokens", type=int, default=128)
+    ap.add_argument(
+        "--gpus",
+        help="GPUs physiques pour la parallélisation, ex: '0,1,2,4'. "
+        "Défaut: CUDA_VISIBLE_DEVICES, sinon tous les GPUs visibles.",
+    )
+    ap.add_argument(
+        "--sequential",
+        action="store_true",
+        help="Force l'exécution séquentielle dans ce process (désactive la parallélisation).",
+    )
+    ap.add_argument(
+        "--out",
+        help="Fichier de résultats JSON. Défaut: results/<model>_<timestamp>.json",
+    )
+    # Flags internes utilisés par les sous-process workers, cachés du --help.
+    ap.add_argument("--worker-variant", dest="worker_variant", help=argparse.SUPPRESS)
+    ap.add_argument("--result-file", dest="result_file", help=argparse.SUPPRESS)
     args = ap.parse_args()
 
     if not torch.cuda.is_available():
         raise SystemExit("CUDA requis (bitsandbytes ne quantifie que sur GPU).")
 
-    tok = AutoTokenizer.from_pretrained(args.model)
-    text = "\n\n".join(
-        load_dataset("Salesforce/wikitext", "wikitext-2-raw-v1", split="test")["text"]
+    # Mode worker : évalue une seule variante, écrit le résultat en JSON, puis quitte.
+    if args.worker_variant:
+        result = run_variant(args.model, args.worker_variant, args.max_tokens, args.gen_tokens)
+        with open(args.result_file, "w", encoding="utf-8") as f:
+            json.dump(result, f)
+        return
+
+    gpus = args.gpus.split(",") if args.gpus else gpu_list_from_env()
+    parallel = not args.sequential and len(gpus) > 1 and len(args.variants) > 1
+
+    print(f"\nmodel = {args.model}   variants = {args.variants}")
+    t0 = time.time()
+
+    if parallel:
+        print(f"GPUs = {gpus}   (exécution parallèle, un sous-process par variante)")
+        tmp_dir = Path(tempfile.mkdtemp(prefix="bench_"))
+        log_dir = Path("logs")
+        log_dir.mkdir(exist_ok=True)
+        try:
+            results = run_parallel(
+                args.model, args.variants, args.max_tokens, args.gen_tokens, gpus, tmp_dir, log_dir
+            )
+        finally:
+            shutil.rmtree(tmp_dir, ignore_errors=True)
+    else:
+        print(f"device = {torch.cuda.get_device_name()}   (exécution séquentielle)")
+        results = [
+            run_variant(args.model, v, args.max_tokens, args.gen_tokens) for v in args.variants
+        ]
+
+    elapsed = time.time() - t0
+
+    # Réordonner selon l'ordre demandé dans --variants (le parallèle ne le garantit pas).
+    order = {v: i for i, v in enumerate(args.variants)}
+    results.sort(key=lambda r: order.get(r["variant"], 999))
+
+    table_lines = print_table(results)
+    print(f"\ntemps total: {elapsed:.1f}s")
+
+    out_path = (
+        Path(args.out)
+        if args.out
+        else Path("results") / f"{args.model.replace('/', '_')}_{datetime.now():%Y%m%d-%H%M%S}.json"
     )
-    enc = tok(text, return_tensors="pt")
-    if args.max_tokens:
-        enc.input_ids = enc.input_ids[:, : args.max_tokens]
-
-    print(f"\nmodel = {args.model}   device = {torch.cuda.get_device_name()}")
-    print(f"{'variant':8} {'ppl':>9} {'VRAM_GB':>9} {'tok/s':>8}")
-    print("-" * 38)
-
-    for name, cfg in build_configs(args.variants).items():
-        torch.cuda.empty_cache()
-        torch.cuda.reset_peak_memory_stats()
-        model = AutoModelForCausalLM.from_pretrained(
-            args.model, device_map="cuda", **cfg
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    with open(out_path, "w", encoding="utf-8") as f:
+        json.dump(
+            {
+                "model": args.model,
+                "variants": args.variants,
+                "max_tokens": args.max_tokens,
+                "gen_tokens": args.gen_tokens,
+                "parallel": parallel,
+                "gpus": gpus,
+                "elapsed_s": elapsed,
+                "results": results,
+                "table": "\n".join(table_lines),
+            },
+            f,
+            indent=2,
+            ensure_ascii=False,
         )
-        model.eval()
-
-        tps = throughput(model, tok, args.gen_tokens)
-        ppl = perplexity(model, enc)
-        vram = torch.cuda.max_memory_allocated() / 1e9
-
-        print(f"{name:8} {ppl:9.3f} {vram:9.2f} {tps:8.1f}")
-
-        del model
-        torch.cuda.empty_cache()
+    print(f"résultats écrits dans {out_path}")
 
 
 if __name__ == "__main__":
