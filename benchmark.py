@@ -35,6 +35,7 @@ from datasets import load_dataset
 from transformers import AutoModelForCausalLM, AutoTokenizer, BitsAndBytesConfig
 
 ALL_VARIANTS = ["fp32", "fp16", "int8", "4bit"]
+FORBIDDEN_GPUS = {"3"}  # GPU 3 hors limites sur cette machine, ne jamais l'utiliser.
 
 
 def build_configs(selected):
@@ -216,6 +217,10 @@ def main():
         return
 
     gpus = args.gpus.split(",") if args.gpus else gpu_list_from_env()
+    excluded = [g for g in gpus if g in FORBIDDEN_GPUS]
+    if excluded:
+        print(f"ATTENTION: GPU(s) {excluded} exclu(s) de la liste (interdits sur cette machine).")
+        gpus = [g for g in gpus if g not in FORBIDDEN_GPUS]
     parallel = not args.sequential and len(gpus) > 1 and len(args.variants) > 1
 
     print(f"\nmodel = {args.model}   variants = {args.variants}")
