@@ -63,6 +63,13 @@ Chaque appel crée un dossier `results/<timestamp>/` avec :
 python measure_dummy_inference.py --duration 60 --gpu-index 0
 ```
 
+Ou via le wrapper qui source le venv du projet automatiquement :
+
+```bash
+./run_test.sh [gpu_index] [duration_s]   # défaut : GPU 0, 60s
+./run_test.sh 1 30                       # GPU 1, 30s
+```
+
 Lance un faux modèle PyTorch sur le GPU choisi et affiche les résultats à la
 fin. Sert à vérifier que `energy_measurement.py` fonctionne avant de le
 brancher sur un vrai benchmark.
