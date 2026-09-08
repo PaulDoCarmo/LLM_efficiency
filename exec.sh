@@ -12,6 +12,10 @@ if [ ! -x "$PY" ]; then
     exit 1
 fi
 
+# Aligne la numerotation CUDA sur celle de nvidia-smi (sinon l'ordre "le plus
+# rapide d'abord" de CUDA peut ne pas correspondre aux indices ci-dessous).
+export CUDA_DEVICE_ORDER=PCI_BUS_ID
+
 # GPU visibles
 export CUDA_VISIBLE_DEVICES=0,1,2,4
 

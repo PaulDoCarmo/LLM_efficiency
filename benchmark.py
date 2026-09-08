@@ -28,6 +28,12 @@ from datetime import datetime
 from pathlib import Path
 from queue import Queue
 
+# Aligne la numérotation CUDA sur celle de nvidia-smi (sinon l'ordre "carte la
+# plus rapide d'abord" de CUDA peut ne pas correspondre aux indices attendus,
+# et un GPU qu'on croit exclure via CUDA_VISIBLE_DEVICES n'est pas le bon).
+# Doit être fait avant le premier appel torch.cuda.*.
+os.environ.setdefault("CUDA_DEVICE_ORDER", "PCI_BUS_ID")
+
 import torch
 
 warnings.filterwarnings("ignore", message="MatMul8bitLt: inputs will be cast")
