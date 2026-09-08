@@ -21,10 +21,10 @@ from transformers import AutoModelForCausalLM, AutoTokenizer, BitsAndBytesConfig
 
 def build_configs(selected):
     all_cfg = {
-        "fp32": dict(torch_dtype=torch.float32),
-        "fp16": dict(torch_dtype=torch.float16),
+        "fp32": dict(dtype=torch.float32),
+        "fp16": dict(dtype=torch.float16),
         "int8": dict(
-            torch_dtype=torch.float16,
+            dtype=torch.float16,
             quantization_config=BitsAndBytesConfig(load_in_8bit=True),
         ),
         "4bit": dict(
