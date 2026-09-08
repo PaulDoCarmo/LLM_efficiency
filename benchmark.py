@@ -1,5 +1,5 @@
 #!/usr/bin/env python
-"""Compare un LLM en fp32 / fp16 / int8 / 4bit : VRAM, débit, et en option
+"""Compare un LLM en fp16 / bf16 / int8 / 4bit : VRAM, débit, et en option
 perplexité / IFEval.
 
 VRAM = pic alloué. tok/s = génération greedy de 128 tokens. Perplexité (--ppl,
@@ -47,7 +47,7 @@ from transformers import AutoModelForCausalLM, AutoTokenizer, BitsAndBytesConfig
 sys.path.insert(0, str(Path(__file__).parent / "energy_measurement"))
 from energy_measurement import EnergyMeasurement  # noqa: E402
 
-ALL_VARIANTS = ["fp32", "fp16", "int8", "4bit"]
+ALL_VARIANTS = ["fp16", "bf16", "int8", "4bit"]
 FORBIDDEN_GPUS = {"3"}  # GPU 3 hors limites sur cette machine, ne jamais l'utiliser.
 WARMUP_GEN_TOKENS = 8  # chauffe hors mesure, avant d'entrer dans EnergyMeasurement.
 IFEVAL_WARMUP_LIMIT = 1  # idem, pour chauffer le cache dataset IFEval + compiler les kernels.
@@ -55,8 +55,8 @@ IFEVAL_WARMUP_LIMIT = 1  # idem, pour chauffer le cache dataset IFEval + compile
 
 def build_configs(selected):
     all_cfg = {
-        "fp32": dict(dtype=torch.float32),
         "fp16": dict(dtype=torch.float16),
+        "bf16": dict(dtype=torch.bfloat16),
         "int8": dict(
             dtype=torch.float16,
             quantization_config=BitsAndBytesConfig(load_in_8bit=True),
