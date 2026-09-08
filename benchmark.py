@@ -50,6 +50,7 @@ from energy_measurement import EnergyMeasurement  # noqa: E402
 ALL_VARIANTS = ["fp32", "fp16", "int8", "4bit"]
 FORBIDDEN_GPUS = {"3"}  # GPU 3 hors limites sur cette machine, ne jamais l'utiliser.
 WARMUP_GEN_TOKENS = 8  # chauffe hors mesure, avant d'entrer dans EnergyMeasurement.
+IFEVAL_WARMUP_LIMIT = 1  # idem, pour chauffer le cache dataset IFEval + compiler les kernels.
 
 
 def build_configs(selected):
@@ -133,13 +134,15 @@ def run_variant(
     """Charge tokenizer+modèle et évalue UNE variante. Suppose que
     CUDA_VISIBLE_DEVICES est déjà positionné correctement par l'appelant.
 
-    Si measure_energy est activé, le débit (et la perplexité si demandée)
-    tournent sous EnergyMeasurement, sur `energy_gpu_index` (index PHYSIQUE
-    nvidia-smi du GPU réellement utilisé par ce process — voir le README de
-    energy_measurement/). IFEval reste hors mesure : lm-evaluation-harness
-    fait ses propres I/O (téléchargement/chargement de données) pendant
-    l'évaluation, ce qui fausserait la trace de puissance (voir
-    energy_measurement/README.md)."""
+    Si measure_energy est activé, le débit, la perplexité (si demandée) et
+    IFEval (si demandé) tournent tous sous EnergyMeasurement, sur
+    `energy_gpu_index` (index PHYSIQUE nvidia-smi du GPU réellement utilisé
+    par ce process — voir le README de energy_measurement/). Comme
+    lm-evaluation-harness télécharge/charge son dataset et compile des
+    kernels de génération au premier appel, un passage IFEval "à vide" (un
+    seul exemple) est fait hors mesure juste avant, uniquement pour chauffer
+    ce cache — le run IFEval réel (celui compté dans les résultats) a lieu
+    dans le bloc mesuré."""
     tok = AutoTokenizer.from_pretrained(model_name)
 
     cfg = build_configs([variant])[variant]
@@ -163,7 +166,17 @@ def run_variant(
     # alloue de la mémoire, ce qui fausserait aussi bien tok/s que la trace
     # de puissance si on le laissait dans le bloc mesuré.
     throughput(model, tok, WARMUP_GEN_TOKENS)
+    if ifeval:
+        # Idem pour IFEval : premier appel = téléchargement/chargement du
+        # dataset + compilation. Un seul exemple suffit à chauffer le cache
+        # (le dataset entier est mis en cache local dès ce premier appel).
+        run_ifeval(model, tok, limit=IFEVAL_WARMUP_LIMIT, batch_size=ifeval_batch_size)
     torch.cuda.synchronize()
+
+    def _run_ifeval_and_record(res):
+        ifeval_metrics = run_ifeval(model, tok, limit=ifeval_limit, batch_size=ifeval_batch_size)
+        res["ifeval"] = ifeval_metrics
+        res["ifeval_score"] = _extract_metric(ifeval_metrics, "prompt_level_strict_acc")
 
     result = {"variant": variant}
 
@@ -177,6 +190,8 @@ def run_variant(
             result["tok_s"] = throughput(model, tok, gen_tokens)
             if compute_ppl:
                 result["ppl"] = perplexity(model, ppl_enc)
+            if ifeval:
+                _run_ifeval_and_record(result)
         result["energy_j"] = em.energy_j
         result["energy_wh"] = em.energy_j / 3600.0
         result["mean_power_w"] = em.mean_power_w
@@ -188,11 +203,8 @@ def run_variant(
         result["tok_s"] = throughput(model, tok, gen_tokens)
         if compute_ppl:
             result["ppl"] = perplexity(model, ppl_enc)
-
-    if ifeval:
-        ifeval_metrics = run_ifeval(model, tok, limit=ifeval_limit, batch_size=ifeval_batch_size)
-        result["ifeval"] = ifeval_metrics
-        result["ifeval_score"] = _extract_metric(ifeval_metrics, "prompt_level_strict_acc")
+        if ifeval:
+            _run_ifeval_and_record(result)
 
     # Mesuré en dernier : capture le pic mémoire de toute l'évaluation (ppl + tok/s + ifeval).
     result["vram_gb"] = torch.cuda.max_memory_allocated() / 1e9

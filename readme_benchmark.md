@@ -86,16 +86,17 @@ int8        10.278      4.97      8.6      0.256     146     52.9%   2
 - **VRAM** — `torch.cuda.max_memory_allocated()`, mesuré après toute
   l'évaluation de la variante (débit + ppl + IFEval si activés).
 - **Énergie** (activée par défaut, `--no-energy` pour désactiver) — chaque
-  variante charge son modèle et fait une petite génération de chauffe hors
-  mesure, puis le débit (et la perplexité si `--ppl`) tournent sous
+  variante charge son modèle, fait une petite génération de chauffe hors
+  mesure (et, si `--ifeval`, un passage IFEval à 1 exemple pour mettre en
+  cache le dataset et compiler les kernels), puis le débit, la perplexité
+  (si `--ppl`) **et IFEval (si `--ifeval`)** tournent tous ensemble sous
   [`EnergyMeasurement`](energy_measurement/README.md) : joules intégrés sur
   la trace `nvidia-smi` réelle, watts moyens, utilisation GPU, VRAM. IFEval
-  reste **hors mesure d'énergie** : `lm-evaluation-harness` fait ses propres
-  I/O (téléchargement/chargement de données) pendant l'évaluation, ce qui
-  fausserait la trace de puissance (voir le protocole détaillé dans
-  `energy_measurement/README.md`). Chaque variante écrit sa trace dans
-  `results/energy/<model>/<variant>/<timestamp>/` (`power_trace.csv`,
-  `energy_timeseries.csv`, `summary.json`).
+  étant le plus long des trois (541 prompts par défaut), c'est aussi lui qui
+  donne la fenêtre de mesure la plus fiable (voir "Bloc d'au moins 60
+  secondes recommandé" dans `energy_measurement/README.md`). Chaque variante
+  écrit sa trace dans `results/energy/<model>/<variant>/<timestamp>/`
+  (`power_trace.csv`, `energy_timeseries.csv`, `summary.json`).
 - **Débit** — génération greedy de 128 tokens, `synchronize()` autour du chrono.
 - **Perplexité** (`--ppl`) — fenêtre glissante sur WikiText-2 test (stride 512,
   contexte 2048), seuls les nouveaux tokens de chaque fenêtre sont scorés.
@@ -104,7 +105,10 @@ int8        10.278      4.97      8.6      0.256     146     52.9%   2
 - **IFEval** (`--ifeval`) — instruction-following, via `lm_eval.simple_evaluate`
   sur le modèle déjà chargé (pas de rechargement). Métrique reportée :
   `prompt_level_strict_acc`. Le détail complet (les 4 sous-métriques IFEval) est
-  conservé dans le JSON de sortie sous `results[].ifeval`.
+  conservé dans le JSON de sortie sous `results[].ifeval`. Compté dans la
+  mesure d'énergie (voir "Énergie" ci-dessus) : seul le premier exemple
+  (chauffe du cache dataset) est exclu, tout le reste — génération sur les
+  541 prompts (ou `--ifeval-limit`) — est dans la fenêtre mesurée.
 
 ## Parallélisation multi-GPU
 
