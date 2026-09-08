@@ -10,8 +10,11 @@ Usage:
 """
 import argparse
 import time
+import warnings
 
 import torch
+
+warnings.filterwarnings("ignore", message="MatMul8bitLt: inputs will be cast")
 from datasets import load_dataset
 from transformers import AutoModelForCausalLM, AutoTokenizer, BitsAndBytesConfig
 
@@ -20,7 +23,10 @@ def build_configs(selected):
     all_cfg = {
         "fp32": dict(torch_dtype=torch.float32),
         "fp16": dict(torch_dtype=torch.float16),
-        "int8": dict(quantization_config=BitsAndBytesConfig(load_in_8bit=True)),
+        "int8": dict(
+            torch_dtype=torch.float16,
+            quantization_config=BitsAndBytesConfig(load_in_8bit=True),
+        ),
         "4bit": dict(
             quantization_config=BitsAndBytesConfig(
                 load_in_4bit=True, bnb_4bit_compute_dtype=torch.float16
