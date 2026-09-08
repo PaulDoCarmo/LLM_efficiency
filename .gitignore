@@ -1,2 +1,4 @@
 CLAUDE.md
 .venv/
+logs/
+results/

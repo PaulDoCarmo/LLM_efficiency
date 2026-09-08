@@ -129,14 +129,22 @@ def run_variant_subprocess(model_name, variant, max_tokens, gen_tokens, gpu_id, 
         "--worker-variant", variant,
         "--result-file", str(result_path),
     ]
+    print(f"[{variant}] démarré sur GPU {gpu_id}", flush=True)
     with open(log_path, "w", encoding="utf-8") as log:
         proc = subprocess.run(cmd, env=env, stdout=log, stderr=subprocess.STDOUT)
     if proc.returncode != 0 or not result_path.exists():
-        return {"variant": variant, "error": f"échec (code {proc.returncode}), voir {log_path}"}
+        result = {"variant": variant, "error": f"échec (code {proc.returncode}), voir {log_path}"}
+        print(f"[{variant}] terminé (ÉCHEC, voir {log_path})", flush=True)
+        return result
     with open(result_path, encoding="utf-8") as f:
         result = json.load(f)
     result["gpu"] = gpu_id
     result_path.unlink(missing_ok=True)
+    print(
+        f"[{variant}] terminé sur GPU {gpu_id} : "
+        f"ppl={result['ppl']:.3f} vram={result['vram_gb']:.2f}GB tok/s={result['tok_s']:.1f}",
+        flush=True,
+    )
     return result
 
 
