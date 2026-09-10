@@ -1,0 +1,91 @@
+# Finetuning QLoRA pour le suivi d'instructions
+
+Finetune `Qwen/Qwen2.5-1.5B` **quantifié en 4bit** (QLoRA) sur
+[`allenai/tulu-3-sft-personas-instruction-following`](https://huggingface.co/datasets/allenai/tulu-3-sft-personas-instruction-following),
+puis évalue le gain sur **IFEval**.
+
+## Installation
+
+En plus des dépendances du projet (`requirements.txt` à la racine) :
+
+```bash
+pip install -r requirements.txt   # inclut peft
+```
+
+## Utilisation
+
+```bash
+# 0. référence : IFEval sur le modèle de base, AVANT finetuning
+python finetuning/eval_ifeval.py --limit 100
+
+# 1. essai rapide pour valider que la boucle tourne (~quelques minutes)
+python finetuning/finetune_lora.py --max-samples 2000 --epochs 1
+
+# 2. entraînement complet
+python finetuning/finetune_lora.py
+
+# 3. IFEval sur le modèle finetuné
+python finetuning/eval_ifeval.py --adapter finetuning/out/qwen2.5-1.5b-qlora-ifeval
+```
+
+Pour choisir le GPU (rappel : **GPU 3 interdit** sur cette machine) :
+
+```bash
+CUDA_VISIBLE_DEVICES=0 python finetuning/finetune_lora.py
+```
+
+## Recette
+
+| Élément | Choix | Pourquoi |
+|---|---|---|
+| Quantification base | NF4 + double quant, calcul bf16 | Recette QLoRA standard. NF4 ≠ fp4 (le défaut de bitsandbytes, utilisé par la variante `4bit` de `benchmark.py`) : niveaux placés sur les quantiles d'une gaussienne, mieux adaptés à des poids normalement distribués. |
+| LoRA | r=16, alpha=32, dropout=0.05 | Réglage courant pour un 1.5B. Cible les projections attention (`q,k,v,o_proj`) **et** MLP (`gate,up,down_proj`). |
+| Perte | Réponse assistant uniquement | Le prompt est masqué à `-100`. C'est ce qu'on veut en instruction tuning : le modèle apprend à répondre, pas à régurgiter la consigne. |
+| Optimiseur | `paged_adamw_8bit` | Optimiseur paginé bitsandbytes, complète la recette QLoRA. |
+| Précision | bf16 | Précision native d'entraînement de Qwen, et native sur A100. |
+| `use_reentrant=False` | gradient checkpointing | Requis pour que le checkpointing coopère avec PEFT. |
+
+Seul l'**adaptateur** est sauvegardé (quelques dizaines de Mo) ; la base 4bit est
+rechargée depuis le Hub à l'évaluation.
+
+## Point d'attention : cohérence de formatage
+
+L'entraînement formate les exemples avec le **chat template** de Qwen
+(`<|im_start|>user ... <|im_start|>assistant ...`). Or les prompts IFEval de
+lm-evaluation-harness sont des instructions **brutes**.
+
+Si on entraîne avec template et qu'on évalue sans, le modèle est hors
+distribution et le score s'effondre. `eval_ifeval.py` applique donc le chat
+template **automatiquement dès qu'un `--adapter` est passé**, et pas pour le
+modèle de base.
+
+Conséquence : avec les réglages par défaut, la base et le finetuné ne sont pas
+évalués dans des conditions strictement identiques, et une partie du gain
+mesuré viendrait alors du **formatage**, pas de l'apprentissage. Pour isoler
+les deux effets, évalue la base dans les deux formats :
+
+```bash
+python finetuning/eval_ifeval.py --limit 100                    # base, prompts bruts
+python finetuning/eval_ifeval.py --limit 100 --chat-template    # base, avec template
+python finetuning/eval_ifeval.py --limit 100 --adapter finetuning/out/...   # finetuné
+```
+
+Le gain réellement attribuable au finetuning, c'est l'écart entre la 3ᵉ ligne
+et la 2ᵉ (même formatage des deux côtés).
+
+## Lien avec `benchmark.py`
+
+`benchmark.py` (racine) compare des **quantifications** du même checkpoint
+(fp16/bf16/int8/4bit) sur VRAM, débit, énergie, IFEval. Ici on fait l'inverse :
+on fixe la quantification (4bit) et on fait **bouger les poids** via LoRA.
+
+Les deux scripts partagent la même métrique IFEval
+(`prompt_level_strict_acc` via lm-evaluation-harness), donc les scores sont
+comparables — à condition d'utiliser le même réglage `apply_chat_template`.
+
+## Ce qui n'a pas été testé
+
+Ces scripts n'ont **pas** été exécutés (pas de GPU sur la machine de
+développement) : ils compilent, mais la première exécution sur l'A100 peut
+demander des ajustements (versions `peft`/`trl`, empreinte VRAM, schéma exact
+du dataset). Commence par `--max-samples 2000 --epochs 1`.
