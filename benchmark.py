@@ -91,16 +91,17 @@ def build_configs(selected):
 
 def _apply_torchao_int4(model, group_size=128):
     """Quantifie le modèle en int4 weight-only (entier uniforme, par groupes)
-    via torchao, en place. API moderne (Int4WeightOnlyConfig + quantize_) pour
-    rester compatible torchao >= 0.14 ; version=1 (kernel tinygemm) demandé
-    explicitement car version 2 vise des GPU Hopper."""
+    via torchao, en place.
+
+    API moderne (Int4WeightOnlyConfig + quantize_) : depuis torchao >= 0.14 les
+    anciens noms (int4_weight_only, autoquant) ont disparu du namespace
+    torchao.quantization, ce qui casse aussi le pont transformers TorchAoConfig
+    — d'où la quantification en post-chargement plutôt que via from_pretrained.
+    On laisse la version de format par défaut : torchao 0.18 a retiré la
+    version 1 (assert config.version == 2)."""
     from torchao.quantization import Int4WeightOnlyConfig, quantize_
 
-    try:
-        cfg = Int4WeightOnlyConfig(group_size=group_size, version=1)
-    except TypeError:  # torchao trop ancien pour le paramètre version
-        cfg = Int4WeightOnlyConfig(group_size=group_size)
-    quantize_(model, cfg)
+    quantize_(model, Int4WeightOnlyConfig(group_size=group_size))
 
 
 @torch.no_grad()
