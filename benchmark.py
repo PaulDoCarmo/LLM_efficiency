@@ -1,9 +1,6 @@
 #!/usr/bin/env python
-"""Compare un LLM en fp16 / bf16 / int8 / 4bit / int4 : VRAM, débit, et en option
+"""Compare un LLM en fp16 / bf16 / int8 / 4bit : VRAM, débit, et en option
 perplexité / IFEval.
-
-"4bit" = bitsandbytes fp4 (float 4 bits, niveaux non uniformes).
-"int4"  = torchao int4 weight-only (vrai entier 4 bits uniforme, par groupes).
 
 VRAM = pic alloué. tok/s = génération greedy de 128 tokens. Perplexité (--ppl,
 désactivée par défaut) calculée sur WikiText-2 (test). Pensé pour un GPU
@@ -20,7 +17,6 @@ Usage:
     CUDA_VISIBLE_DEVICES=0,1,2,4 python benchmark.py   # 4 variantes en parallèle, une par GPU
     python benchmark.py --ifeval --ifeval-limit 40     # + score IFEval (sous-échantillonné)
     python benchmark.py --ppl                          # + perplexité WikiText-2
-    python benchmark.py --variants int8 int4 --ifeval  # compare seulement int8 et int4
 """
 import argparse
 import json
@@ -51,57 +47,27 @@ from transformers import AutoModelForCausalLM, AutoTokenizer, BitsAndBytesConfig
 sys.path.insert(0, str(Path(__file__).parent / "energy_measurement"))
 from energy_measurement import EnergyMeasurement  # noqa: E402
 
-ALL_VARIANTS = ["fp16", "bf16", "int8", "4bit", "int4"]
+ALL_VARIANTS = ["fp16", "bf16", "int8", "4bit"]
 FORBIDDEN_GPUS = {"3"}  # GPU 3 hors limites sur cette machine, ne jamais l'utiliser.
 WARMUP_GEN_TOKENS = 8  # chauffe hors mesure, avant d'entrer dans EnergyMeasurement.
 IFEVAL_WARMUP_LIMIT = 1  # idem, pour chauffer le cache dataset IFEval + compiler les kernels.
 
 
 def build_configs(selected):
-    """Config `from_pretrained` par variante. Construit uniquement celles
-    demandées : ça évite d'importer torchao (variante int4) si on ne s'en
-    sert pas."""
-
-    def _make(name):
-        if name == "fp16":
-            return dict(dtype=torch.float16)
-        if name == "bf16":
-            return dict(dtype=torch.bfloat16)
-        if name == "int8":
-            return dict(
-                dtype=torch.float16,
-                quantization_config=BitsAndBytesConfig(load_in_8bit=True),
+    all_cfg = {
+        "fp16": dict(dtype=torch.float16),
+        "bf16": dict(dtype=torch.bfloat16),
+        "int8": dict(
+            dtype=torch.float16,
+            quantization_config=BitsAndBytesConfig(load_in_8bit=True),
+        ),
+        "4bit": dict(
+            quantization_config=BitsAndBytesConfig(
+                load_in_4bit=True, bnb_4bit_compute_dtype=torch.float16
             )
-        if name == "4bit":  # bitsandbytes fp4 : float 4 bits, niveaux non uniformes
-            return dict(
-                quantization_config=BitsAndBytesConfig(
-                    load_in_4bit=True, bnb_4bit_compute_dtype=torch.float16
-                )
-            )
-        if name == "int4":
-            # torchao int4 entier uniforme, par groupes. Appliqué APRÈS
-            # from_pretrained (voir _apply_torchao_int4) : le pont
-            # transformers TorchAoConfig utilise les anciens noms d'API
-            # (int4_weight_only/autoquant), supprimés dans torchao >= 0.14.
-            return dict(dtype=torch.bfloat16)
-        raise KeyError(name)
-
-    return {k: _make(k) for k in selected}
-
-
-def _apply_torchao_int4(model, group_size=128):
-    """Quantifie le modèle en int4 weight-only (entier uniforme, par groupes)
-    via torchao, en place.
-
-    API moderne (Int4WeightOnlyConfig + quantize_) : depuis torchao >= 0.14 les
-    anciens noms (int4_weight_only, autoquant) ont disparu du namespace
-    torchao.quantization, ce qui casse aussi le pont transformers TorchAoConfig
-    — d'où la quantification en post-chargement plutôt que via from_pretrained.
-    On laisse la version de format par défaut : torchao 0.18 a retiré la
-    version 1 (assert config.version == 2)."""
-    from torchao.quantization import Int4WeightOnlyConfig, quantize_
-
-    quantize_(model, Int4WeightOnlyConfig(group_size=group_size))
+        ),
+    }
+    return {k: all_cfg[k] for k in selected}
 
 
 @torch.no_grad()
@@ -125,12 +91,6 @@ def throughput(model, tok, n=128):
     return (out.size(1) - ids.size(1)) / (time.time() - t0)
 
 
-def _ifeval_batch_size(v):
-    """--ifeval-batch-size accepte un entier ou 'auto' (lm-eval cherche alors
-    le plus grand batch qui tient dans la VRAM libre)."""
-    return v if v in ("auto",) or str(v).startswith("auto:") else int(v)
-
-
 def _extract_metric(metrics, name):
     """lm-eval préfixe les clés avec le nom du filtre (ex: 'prompt_level_strict_acc,none')."""
     for k, v in metrics.items():
@@ -139,7 +99,7 @@ def _extract_metric(metrics, name):
     return None
 
 
-def run_ifeval(model, tok, limit=None, batch_size=8):
+def run_ifeval(model, tok, limit=None, batch_size=4):
     """Évalue IFEval (instruction-following) sur le modèle déjà chargé, via
     lm-evaluation-harness. Import différé : lm_eval reste optionnel tant
     qu'on ne passe pas --ifeval."""
@@ -166,7 +126,7 @@ def run_variant(
     compute_ppl=False,
     ifeval=False,
     ifeval_limit=None,
-    ifeval_batch_size=8,
+    ifeval_batch_size=4,
     measure_energy=True,
     energy_gpu_index=0,
     energy_dir=None,
@@ -189,13 +149,6 @@ def run_variant(
     torch.cuda.empty_cache()
     torch.cuda.reset_peak_memory_stats()
     model = AutoModelForCausalLM.from_pretrained(model_name, device_map="cuda", **cfg)
-    if variant == "int4":
-        _apply_torchao_int4(model)
-        # Le modèle est chargé en bf16 puis packé en int4 : on ré-arme la mesure
-        # de pic après packing pour ne pas compter le pic transitoire du bf16
-        # (les variantes bnb, elles, quantifient déjà pendant from_pretrained).
-        torch.cuda.empty_cache()
-        torch.cuda.reset_peak_memory_stats()
     model.eval()
 
     # Toute I/O (chargement de données) doit être terminée avant d'entrer
@@ -281,7 +234,7 @@ def run_variant_subprocess(
     compute_ppl=False,
     ifeval=False,
     ifeval_limit=None,
-    ifeval_batch_size=8,
+    ifeval_batch_size=4,
     measure_energy=True,
     energy_out=None,
 ):
@@ -348,7 +301,7 @@ def run_parallel(
     compute_ppl=False,
     ifeval=False,
     ifeval_limit=None,
-    ifeval_batch_size=8,
+    ifeval_batch_size=4,
     measure_energy=True,
     energy_out=None,
 ):
@@ -464,13 +417,9 @@ def main():
     )
     ap.add_argument(
         "--ifeval-batch-size",
-        type=_ifeval_batch_size,
-        default=8,
-        help="Batch size IFEval : entier (défaut 8), ou 'auto' pour que lm-eval "
-        "cherche le plus grand batch qui tient dans la VRAM libre. ATTENTION: "
-        "'auto' casse les kernels LLM.int8() de bitsandbytes (erreur CUDA "
-        "'invalid configuration argument' sur gros batch) — à réserver aux "
-        "variantes fp16/bf16/4bit/int4.",
+        type=int,
+        default=4,
+        help="Batch size pour l'évaluation IFEval.",
     )
     ap.add_argument(
         "--no-energy",
