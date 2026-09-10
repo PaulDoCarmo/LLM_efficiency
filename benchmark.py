@@ -51,6 +51,18 @@ ALL_VARIANTS = ["fp16", "bf16", "int8", "4bit"]
 FORBIDDEN_GPUS = {"3"}  # GPU 3 hors limites sur cette machine, ne jamais l'utiliser.
 WARMUP_GEN_TOKENS = 8  # chauffe hors mesure, avant d'entrer dans EnergyMeasurement.
 IFEVAL_WARMUP_LIMIT = 1  # idem, pour chauffer le cache dataset IFEval + compiler les kernels.
+# Plafond de génération de la tâche IFEval dans lm-evaluation-harness (constaté
+# via le warning HF "max_new_tokens (=2048)"). Ne pas y toucher : une réponse
+# qui l'atteint n'a pas fini de générer, on ne sait pas ce qu'elle aurait dit
+# ensuite — ça ne doit pas être confondu avec une vraie mesure de verbosité.
+# À revérifier si la version de lm_eval change.
+IFEVAL_GEN_TOKEN_CAP = 2048
+# Calibrage --ifeval-batch-size=auto : génération plus courte que le pire cas
+# réel (IFEVAL_GEN_TOKEN_CAP) pour rester rapide, marge de sécurité ensuite
+# appliquée car les vraies réponses IFEval peuvent remplir un KV-cache bien
+# plus gros que ce calibrage.
+IFEVAL_CALIBRATION_GEN_TOKENS = 256
+IFEVAL_BATCH_SAFETY_MARGIN = 0.5
 
 
 def build_configs(selected):
@@ -89,6 +101,44 @@ def throughput(model, tok, n=128):
     out = model.generate(ids, max_new_tokens=n, do_sample=False)
     torch.cuda.synchronize()
     return (out.size(1) - ids.size(1)) / (time.time() - t0)
+
+
+def find_max_ifeval_batch_size(model, tok, max_batch=256):
+    """Calibre le plus grand batch qui tient dans la VRAM libre, par
+    doublement (1, 2, 4, ...), avant d'entrer dans le bloc mesuré. Le
+    résultat est ensuite utilisé comme batch EXPLICITE et FIXE pour le run
+    réel (décision figée : jamais 'auto' pendant la mesure elle-même, voir
+    CLAUDE.md) — seul ce calibrage, hors mesure, est adaptatif."""
+    prompt_ids = tok(
+        "Write a detailed, step-by-step explanation of how photosynthesis works.",
+        return_tensors="pt",
+    ).input_ids
+
+    best = 1
+    batch = 1
+    while batch <= max_batch:
+        try:
+            torch.cuda.empty_cache()
+            ids = prompt_ids.repeat(batch, 1).to(model.device)
+            with torch.no_grad():
+                model.generate(ids, max_new_tokens=IFEVAL_CALIBRATION_GEN_TOKENS, do_sample=False)
+            torch.cuda.synchronize()
+            best = batch
+            batch *= 2
+        except torch.cuda.OutOfMemoryError:
+            torch.cuda.empty_cache()
+            break
+
+    torch.cuda.empty_cache()
+    # Marge de sécurité : les vraies réponses IFEval peuvent être bien plus
+    # longues (jusqu'à IFEVAL_GEN_TOKEN_CAP) que ce calibrage, donc leur
+    # KV-cache est plus gros à batch égal.
+    return max(1, int(best * IFEVAL_BATCH_SAFETY_MARGIN))
+
+
+def _parse_ifeval_batch_size(value):
+    """Pour --ifeval-batch-size : 'auto' tel quel, sinon un entier."""
+    return value if value == "auto" else int(value)
 
 
 def _extract_metric(metrics, name):
@@ -143,7 +193,7 @@ def run_variant(
     compute_ppl=False,
     ifeval=False,
     ifeval_limit=None,
-    ifeval_batch_size=4,
+    ifeval_batch_size="auto",
     measure_energy=True,
     energy_gpu_index=0,
     energy_dir=None,
@@ -184,6 +234,11 @@ def run_variant(
     # de puissance si on le laissait dans le bloc mesuré.
     throughput(model, tok, WARMUP_GEN_TOKENS)
     if ifeval:
+        if ifeval_batch_size == "auto":
+            # Calibrage hors mesure : remplace "auto" par le plus grand batch
+            # explicite qui tient en VRAM pour CE modèle/CETTE variante.
+            ifeval_batch_size = find_max_ifeval_batch_size(model, tok)
+            torch.cuda.reset_peak_memory_stats()  # le calibrage ne doit pas polluer le pic VRAM rapporté
         # Idem pour IFEval : premier appel = téléchargement/chargement du
         # dataset + compilation. Un seul exemple suffit à chauffer le cache
         # (le dataset entier est mis en cache local dès ce premier appel).
@@ -198,12 +253,18 @@ def run_variant(
         ifeval_elapsed_s = time.time() - t0
         res["ifeval"] = ifeval_metrics
         res["ifeval_score"] = _extract_metric(ifeval_metrics, "prompt_level_strict_acc")
+        # Batch réellement utilisé (fixe, explicite) — y compris quand il vient
+        # du calibrage auto, pour garder une trace exacte (décision figée #5).
+        res["ifeval_batch_size_used"] = ifeval_batch_size
 
         token_counts = _ifeval_generated_token_counts(samples, tok)
         total_tokens = sum(token_counts)
         res["ifeval_tokens_per_response"] = token_counts
         res["ifeval_total_tokens"] = total_tokens
         res["ifeval_mean_tokens_per_response"] = total_tokens / len(token_counts)
+        capped = sum(1 for c in token_counts if c >= IFEVAL_GEN_TOKEN_CAP)
+        res["ifeval_capped_responses"] = capped
+        res["ifeval_capped_rate"] = capped / len(token_counts)
         res["ifeval_elapsed_s"] = ifeval_elapsed_s
         res["ifeval_time_per_token_s"] = ifeval_elapsed_s / total_tokens
 
@@ -268,7 +329,7 @@ def run_variant_subprocess(
     compute_ppl=False,
     ifeval=False,
     ifeval_limit=None,
-    ifeval_batch_size=4,
+    ifeval_batch_size="auto",
     measure_energy=True,
     energy_out=None,
 ):
@@ -335,7 +396,7 @@ def run_parallel(
     compute_ppl=False,
     ifeval=False,
     ifeval_limit=None,
-    ifeval_batch_size=4,
+    ifeval_batch_size="auto",
     measure_energy=True,
     energy_out=None,
 ):
@@ -451,9 +512,12 @@ def main():
     )
     ap.add_argument(
         "--ifeval-batch-size",
-        type=int,
-        default=4,
-        help="Batch size pour l'évaluation IFEval.",
+        type=_parse_ifeval_batch_size,
+        default="auto",
+        help="Batch size pour l'évaluation IFEval : un entier fixe, ou 'auto' "
+        "(défaut) pour calibrer automatiquement le plus grand batch qui tient "
+        "dans la VRAM libre, hors mesure, avant de l'utiliser comme batch fixe "
+        "pour le run réel (voir find_max_ifeval_batch_size).",
     )
     ap.add_argument(
         "--no-energy",
