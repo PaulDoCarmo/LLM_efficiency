@@ -99,10 +99,14 @@ def _extract_metric(metrics, name):
     return None
 
 
-def run_ifeval(model, tok, limit=None, batch_size=4):
+def run_ifeval(model, tok, limit=None, batch_size=4, log_samples=False):
     """Évalue IFEval (instruction-following) sur le modèle déjà chargé, via
     lm-evaluation-harness. Import différé : lm_eval reste optionnel tant
-    qu'on ne passe pas --ifeval."""
+    qu'on ne passe pas --ifeval.
+
+    Si log_samples, renvoie aussi les échantillons bruts par prompt
+    (nécessaires pour compter les tokens générés, voir
+    _ifeval_generated_token_counts) — sinon le deuxième élément est None."""
     import logging
 
     from lm_eval import simple_evaluate
@@ -110,8 +114,21 @@ def run_ifeval(model, tok, limit=None, batch_size=4):
 
     logging.getLogger("lm-eval").setLevel(logging.WARNING)
     lm = HFLM(pretrained=model, tokenizer=tok, batch_size=batch_size)
-    out = simple_evaluate(model=lm, tasks=["ifeval"], limit=limit, bootstrap_iters=0)
-    return out["results"]["ifeval"]
+    out = simple_evaluate(
+        model=lm, tasks=["ifeval"], limit=limit, bootstrap_iters=0, log_samples=log_samples
+    )
+    samples = out["samples"]["ifeval"] if log_samples else None
+    return out["results"]["ifeval"], samples
+
+
+def _ifeval_generated_token_counts(samples, tok):
+    """Longueur (en tokens) de la génération brute pour chaque prompt IFEval.
+
+    Schéma vérifié sur lm-evaluation-harness 0.4.4 : pour une tâche
+    generate_until, chaque échantillon a resps=[[texte_généré]] (un seul
+    essai, une seule continuation). À revérifier si la version installée
+    diffère de celle de requirements.txt."""
+    return [len(tok(s["resps"][0][0], add_special_tokens=False).input_ids) for s in samples]
 
 
 def energy_output_dir(model_name, variant, base="results/energy"):
@@ -170,13 +187,25 @@ def run_variant(
         # Idem pour IFEval : premier appel = téléchargement/chargement du
         # dataset + compilation. Un seul exemple suffit à chauffer le cache
         # (le dataset entier est mis en cache local dès ce premier appel).
-        run_ifeval(model, tok, limit=IFEVAL_WARMUP_LIMIT, batch_size=ifeval_batch_size)
+        run_ifeval(model, tok, limit=IFEVAL_WARMUP_LIMIT, batch_size=ifeval_batch_size)  # (metrics, None)
     torch.cuda.synchronize()
 
     def _run_ifeval_and_record(res):
-        ifeval_metrics = run_ifeval(model, tok, limit=ifeval_limit, batch_size=ifeval_batch_size)
+        t0 = time.time()
+        ifeval_metrics, samples = run_ifeval(
+            model, tok, limit=ifeval_limit, batch_size=ifeval_batch_size, log_samples=True
+        )
+        ifeval_elapsed_s = time.time() - t0
         res["ifeval"] = ifeval_metrics
         res["ifeval_score"] = _extract_metric(ifeval_metrics, "prompt_level_strict_acc")
+
+        token_counts = _ifeval_generated_token_counts(samples, tok)
+        total_tokens = sum(token_counts)
+        res["ifeval_tokens_per_response"] = token_counts
+        res["ifeval_total_tokens"] = total_tokens
+        res["ifeval_mean_tokens_per_response"] = total_tokens / len(token_counts)
+        res["ifeval_elapsed_s"] = ifeval_elapsed_s
+        res["ifeval_time_per_token_s"] = ifeval_elapsed_s / total_tokens
 
     result = {"variant": variant}
 
@@ -199,6 +228,11 @@ def run_variant(
         result["peak_vram_mib"] = em.peak_vram_mib
         result["mean_vram_mib"] = em.mean_vram_mib
         result["energy_run_dir"] = str(em.run_dir)
+        if result.get("ifeval_total_tokens"):
+            # Approximation : le bloc mesuré inclut aussi le probe tok/s
+            # (WARMUP_GEN_TOKENS tokens, négligeable face aux ~541 prompts
+            # IFEval) — attribué ici entièrement à IFEval plutôt que réparti.
+            result["energy_per_token_j"] = result["energy_j"] / result["ifeval_total_tokens"]
     else:
         result["tok_s"] = throughput(model, tok, gen_tokens)
         if compute_ppl:
