@@ -78,16 +78,29 @@ def build_configs(selected):
                     load_in_4bit=True, bnb_4bit_compute_dtype=torch.float16
                 )
             )
-        if name == "int4":  # torchao : vrai int4 entier uniforme, quantifié par groupes
-            from transformers import TorchAoConfig
-
-            return dict(
-                dtype=torch.bfloat16,
-                quantization_config=TorchAoConfig("int4_weight_only", group_size=128),
-            )
+        if name == "int4":
+            # torchao int4 entier uniforme, par groupes. Appliqué APRÈS
+            # from_pretrained (voir _apply_torchao_int4) : le pont
+            # transformers TorchAoConfig utilise les anciens noms d'API
+            # (int4_weight_only/autoquant), supprimés dans torchao >= 0.14.
+            return dict(dtype=torch.bfloat16)
         raise KeyError(name)
 
     return {k: _make(k) for k in selected}
+
+
+def _apply_torchao_int4(model, group_size=128):
+    """Quantifie le modèle en int4 weight-only (entier uniforme, par groupes)
+    via torchao, en place. API moderne (Int4WeightOnlyConfig + quantize_) pour
+    rester compatible torchao >= 0.14 ; version=1 (kernel tinygemm) demandé
+    explicitement car version 2 vise des GPU Hopper."""
+    from torchao.quantization import Int4WeightOnlyConfig, quantize_
+
+    try:
+        cfg = Int4WeightOnlyConfig(group_size=group_size, version=1)
+    except TypeError:  # torchao trop ancien pour le paramètre version
+        cfg = Int4WeightOnlyConfig(group_size=group_size)
+    quantize_(model, cfg)
 
 
 @torch.no_grad()
@@ -175,6 +188,13 @@ def run_variant(
     torch.cuda.empty_cache()
     torch.cuda.reset_peak_memory_stats()
     model = AutoModelForCausalLM.from_pretrained(model_name, device_map="cuda", **cfg)
+    if variant == "int4":
+        _apply_torchao_int4(model)
+        # Le modèle est chargé en bf16 puis packé en int4 : on ré-arme la mesure
+        # de pic après packing pour ne pas compter le pic transitoire du bf16
+        # (les variantes bnb, elles, quantifient déjà pendant from_pretrained).
+        torch.cuda.empty_cache()
+        torch.cuda.reset_peak_memory_stats()
     model.eval()
 
     # Toute I/O (chargement de données) doit être terminée avant d'entrer
