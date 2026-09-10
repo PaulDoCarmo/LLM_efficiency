@@ -138,7 +138,7 @@ def _extract_metric(metrics, name):
     return None
 
 
-def run_ifeval(model, tok, limit=None, batch_size="auto"):
+def run_ifeval(model, tok, limit=None, batch_size=8):
     """Évalue IFEval (instruction-following) sur le modèle déjà chargé, via
     lm-evaluation-harness. Import différé : lm_eval reste optionnel tant
     qu'on ne passe pas --ifeval."""
@@ -165,7 +165,7 @@ def run_variant(
     compute_ppl=False,
     ifeval=False,
     ifeval_limit=None,
-    ifeval_batch_size="auto",
+    ifeval_batch_size=8,
     measure_energy=True,
     energy_gpu_index=0,
     energy_dir=None,
@@ -280,7 +280,7 @@ def run_variant_subprocess(
     compute_ppl=False,
     ifeval=False,
     ifeval_limit=None,
-    ifeval_batch_size="auto",
+    ifeval_batch_size=8,
     measure_energy=True,
     energy_out=None,
 ):
@@ -347,7 +347,7 @@ def run_parallel(
     compute_ppl=False,
     ifeval=False,
     ifeval_limit=None,
-    ifeval_batch_size="auto",
+    ifeval_batch_size=8,
     measure_energy=True,
     energy_out=None,
 ):
@@ -464,10 +464,12 @@ def main():
     ap.add_argument(
         "--ifeval-batch-size",
         type=_ifeval_batch_size,
-        default="auto",
-        help="Batch size IFEval : entier, ou 'auto' (défaut) — lm-eval cherche le "
-        "plus grand batch qui tient dans la VRAM libre, donc plus gros pour "
-        "int4/4bit (modèle plus petit) que pour int8.",
+        default=8,
+        help="Batch size IFEval : entier (défaut 8), ou 'auto' pour que lm-eval "
+        "cherche le plus grand batch qui tient dans la VRAM libre. ATTENTION: "
+        "'auto' casse les kernels LLM.int8() de bitsandbytes (erreur CUDA "
+        "'invalid configuration argument' sur gros batch) — à réserver aux "
+        "variantes fp16/bf16/4bit/int4.",
     )
     ap.add_argument(
         "--no-energy",
