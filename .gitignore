@@ -2,3 +2,5 @@ CLAUDE.md
 .venv/
 logs/
 results/
+__pycache__/
+finetuning/out/
