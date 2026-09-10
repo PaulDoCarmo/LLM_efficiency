@@ -38,10 +38,17 @@ os.environ.setdefault("CUDA_DEVICE_ORDER", "PCI_BUS_ID")
 import torch
 from transformers import AutoModelForCausalLM, AutoTokenizer, BitsAndBytesConfig
 
-# Réutilise l'implémentation IFEval de benchmark.py plutôt que de la dupliquer :
-# les scores restent comparables au tableau des variantes de quantification.
+# Réutilise le monitoring de benchmark.py (IFEval, débit, énergie, VRAM)
+# plutôt que de le dupliquer : les chiffres restent comparables au tableau
+# des variantes de quantification.
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
-from benchmark import _extract_metric, run_ifeval  # noqa: E402
+from benchmark import (  # noqa: E402
+    _extract_metric,
+    energy_output_dir,
+    gpu_list_from_env,
+    measure_loaded_model,
+    print_table,
+)
 from finetune_lora import QWEN_LORA_TARGETS  # noqa: E402
 
 IFEVAL_METRICS = [
@@ -184,7 +191,38 @@ def main():
     ap.add_argument("--batch-size", type=int, default=16)
     ap.add_argument("--lora-r", type=int, default=16, help="Mode --dummy uniquement.")
     ap.add_argument("--lora-alpha", type=int, default=32, help="Mode --dummy uniquement.")
+    ap.add_argument(
+        "--gen-tokens",
+        type=int,
+        default=128,
+        help="Longueur de génération pour la mesure de débit (comme benchmark.py).",
+    )
+    ap.add_argument(
+        "--chat-template",
+        action="store_true",
+        help="Applique le chat template aux prompts IFEval. À activer si l'adaptateur "
+        "a été entraîné au format chat (c'est le cas de finetune_lora.py) ; laissé "
+        "désactivé par défaut pour rester identique à benchmark.py.",
+    )
+    ap.add_argument(
+        "--no-energy",
+        dest="measure_energy",
+        action="store_false",
+        help="Désactive la mesure d'énergie (activée par défaut, comme benchmark.py).",
+    )
+    ap.add_argument(
+        "--energy-gpu-index",
+        type=int,
+        default=None,
+        help="Index PHYSIQUE nvidia-smi du GPU à surveiller. Défaut: premier de "
+        "CUDA_VISIBLE_DEVICES.",
+    )
+    ap.add_argument(
+        "--energy-out",
+        help="Dossier racine des traces d'énergie. Défaut: results/energy/<model>/<variant>/.",
+    )
     ap.add_argument("--out", help="Fichier JSON de résultats.")
+    ap.set_defaults(measure_energy=True)
     args = ap.parse_args()
 
     if not torch.cuda.is_available():
@@ -195,14 +233,25 @@ def main():
         raise SystemExit(f"adaptateur introuvable : {args.adapter}")
 
     merged_dir = Path(args.merged_dir)
+    # Le modèle tourne sur le premier GPU visible ; nvidia-smi, lui, voit
+    # toujours l'index physique (cf. energy_measurement/README.md).
+    gpus = gpu_list_from_env()
+    energy_gpu_index = (
+        args.energy_gpu_index
+        if args.energy_gpu_index is not None
+        else (int(gpus[0]) if gpus else 0)
+    )
+
     print(f"base       = {args.base}")
     print(f"adaptateur = {'(dummy, non entraîné)' if args.dummy else args.adapter}")
     print(f"quant      = {args.quant_type}   fusion -> {args.merge_into}   batch = {args.batch_size}")
+    print(f"énergie    = {args.measure_energy} (GPU physique {energy_gpu_index})")
 
     tok = AutoTokenizer.from_pretrained(args.base if args.dummy else args.adapter)
     if tok.pad_token is None:
         tok.pad_token = tok.eos_token
 
+    torch.cuda.empty_cache()
     torch.cuda.reset_peak_memory_stats()
     if args.merge_into == "quantized":
         print("\n[1/2] chargement 4 bits + fusion de l'adaptateur en place...")
@@ -220,13 +269,41 @@ def main():
             args.lora_alpha,
             args.quant_type,
         )
-    vram_gb = torch.cuda.max_memory_allocated() / 1e9
-    print(f"      VRAM : {vram_gb:.2f} GB")
+    print("[2/2] débit + IFEval + énergie (monitoring de benchmark.py)...")
+    label = "dummy" if args.dummy else "lora"
+    variant = f"merged4bit-{label}-{args.quant_type}"
+    energy_dir = (
+        Path(args.energy_out) / label
+        if args.energy_out
+        else energy_output_dir(args.base, variant)
+    )
+    result = measure_loaded_model(
+        model,
+        tok,
+        gen_tokens=args.gen_tokens,
+        ifeval=True,
+        ifeval_limit=args.limit,
+        ifeval_batch_size=args.batch_size,
+        ifeval_chat_template=args.chat_template,
+        measure_energy=args.measure_energy,
+        energy_gpu_index=energy_gpu_index,
+        energy_dir=energy_dir,
+        energy_metadata={
+            "model": args.base,
+            "adapter": args.adapter,
+            "variant": variant,
+            "gen_tokens": args.gen_tokens,
+            "merge_into": args.merge_into,
+        },
+    )
+    result["variant"] = label
+    result["gpu"] = energy_gpu_index
+    metrics = result.get("ifeval", {})
 
-    print("[2/2] IFEval (implémentation de benchmark.py)...")
-    metrics = run_ifeval(model, tok, limit=args.limit, batch_size=args.batch_size)
+    # Même tableau que benchmark.py (fonction importée), donc colonnes alignées.
+    table_lines = print_table([result], ifeval=True)
 
-    print("\nIFEval")
+    print("\nIFEval (détail)")
     print("-" * 34)
     for name in IFEVAL_METRICS:
         value = _extract_metric(metrics, name)
@@ -247,9 +324,12 @@ def main():
                 "merge_into": args.merge_into,
                 "limit": args.limit,
                 "batch_size": args.batch_size,
-                "vram_gb": vram_gb,
-                "ifeval": metrics,
-                "ifeval_score": _extract_metric(metrics, "prompt_level_strict_acc"),
+                "gen_tokens": args.gen_tokens,
+                "chat_template": args.chat_template,
+                "measure_energy": args.measure_energy,
+                "gpu": energy_gpu_index,
+                "result": result,
+                "table": "\n".join(table_lines),
             },
             f,
             indent=2,

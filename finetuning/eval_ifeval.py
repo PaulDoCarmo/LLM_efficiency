@@ -4,20 +4,24 @@
 Sert à mesurer le gain du finetuning de finetune_lora.py : lance-le une fois
 sans --adapter (base de référence) et une fois avec, et compare.
 
+Le monitoring est **exactement celui de benchmark.py** : on importe son
+`measure_loaded_model`, donc même chauffe hors mesure, même fenêtre
+EnergyMeasurement, mêmes clés de résultat (tok_s, energy_wh, mean_power_w,
+vram_gb, ...) et même tableau d'affichage.
+
 Le modèle est chargé en 4bit NF4 par défaut, dans les mêmes conditions qu'à
 l'entraînement. Comme le finetuning utilise le chat template, l'évaluation
 l'applique aussi dès qu'un adaptateur est chargé (--no-chat-template pour
 forcer les prompts bruts).
 
 Usage:
-    python finetuning/eval_ifeval.py                                  # base, référence
-    python finetuning/eval_ifeval.py --adapter finetuning/out/...     # finetuné
-    python finetuning/eval_ifeval.py --adapter ... --limit 40         # aperçu rapide
+    python finetuning/eval_ifeval.py --limit 100 --chat-template        # référence
+    python finetuning/eval_ifeval.py --limit 100 --adapter finetuning/out/...
 """
 import argparse
 import json
-import logging
 import os
+import sys
 from datetime import datetime
 from pathlib import Path
 
@@ -26,20 +30,22 @@ os.environ.setdefault("CUDA_DEVICE_ORDER", "PCI_BUS_ID")
 import torch
 from transformers import AutoModelForCausalLM, AutoTokenizer, BitsAndBytesConfig
 
+# Monitoring partagé avec benchmark.py : importé, pas recopié.
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+from benchmark import (  # noqa: E402
+    _extract_metric,
+    energy_output_dir,
+    gpu_list_from_env,
+    measure_loaded_model,
+    print_table,
+)
+
 IFEVAL_METRICS = [
     "prompt_level_strict_acc",
     "inst_level_strict_acc",
     "prompt_level_loose_acc",
     "inst_level_loose_acc",
 ]
-
-
-def extract_metric(metrics, name):
-    """lm-eval suffixe les clés du nom du filtre (ex: 'prompt_level_strict_acc,none')."""
-    for k, v in metrics.items():
-        if k.split(",")[0] == name:
-            return v
-    return None
 
 
 def load_model(model_name, adapter, four_bit):
@@ -84,6 +90,12 @@ def main():
     )
     ap.add_argument("--batch-size", type=int, default=4)
     ap.add_argument(
+        "--gen-tokens",
+        type=int,
+        default=128,
+        help="Longueur de génération pour la mesure de débit (comme benchmark.py).",
+    )
+    ap.add_argument(
         "--no-4bit",
         dest="four_bit",
         action="store_false",
@@ -103,12 +115,31 @@ def main():
         help="Force l'envoi des prompts IFEval bruts. Par défaut le template est "
         "appliqué dès qu'un adaptateur est chargé (cohérence avec l'entraînement).",
     )
+    ap.add_argument(
+        "--no-energy",
+        dest="measure_energy",
+        action="store_false",
+        help="Désactive la mesure d'énergie (activée par défaut, comme benchmark.py).",
+    )
+    ap.add_argument(
+        "--energy-gpu-index",
+        type=int,
+        default=None,
+        help="Index PHYSIQUE nvidia-smi du GPU à surveiller. Défaut: premier de "
+        "CUDA_VISIBLE_DEVICES.",
+    )
+    ap.add_argument(
+        "--energy-out",
+        help="Dossier racine des traces d'énergie. Défaut: results/energy/<model>/<variant>/.",
+    )
     ap.add_argument("--out", help="Fichier JSON de résultats. Défaut: results/ifeval_<ts>.json")
-    ap.set_defaults(four_bit=True, chat_template=None)
+    ap.set_defaults(four_bit=True, chat_template=None, measure_energy=True)
     args = ap.parse_args()
 
     if not torch.cuda.is_available():
         raise SystemExit("CUDA requis.")
+    if args.adapter and not Path(args.adapter).is_dir():
+        raise SystemExit(f"adaptateur introuvable : {args.adapter}")
 
     # Par défaut : template appliqué si (et seulement si) on évalue un finetuné,
     # puisque c'est le format vu à l'entraînement.
@@ -116,38 +147,72 @@ def main():
     if chat_template is None:
         chat_template = args.adapter is not None
 
+    # Le modèle tourne sur le premier GPU visible ; nvidia-smi, lui, voit
+    # toujours l'index physique (cf. energy_measurement/README.md).
+    gpus = gpu_list_from_env()
+    energy_gpu_index = (
+        args.energy_gpu_index
+        if args.energy_gpu_index is not None
+        else (int(gpus[0]) if gpus else 0)
+    )
+
+    label = "lora" if args.adapter else "base"
+    variant = f"ifeval-{label}-{'4bit' if args.four_bit else 'bf16'}"
+
     print(f"modèle  = {args.model}")
     print(f"adapter = {args.adapter or '(aucun — base de référence)'}")
     print(f"4bit    = {args.four_bit}   chat_template = {chat_template}")
+    print(f"énergie = {args.measure_energy} (GPU physique {energy_gpu_index})")
 
     # Le tokenizer de l'adaptateur peut différer (tokens spéciaux ajoutés).
     tok = AutoTokenizer.from_pretrained(args.adapter or args.model)
     if tok.pad_token is None:
         tok.pad_token = tok.eos_token
+
+    torch.cuda.empty_cache()
+    torch.cuda.reset_peak_memory_stats()
     model = load_model(args.model, args.adapter, args.four_bit)
 
-    from lm_eval import simple_evaluate
-    from lm_eval.models.huggingface import HFLM
-
-    logging.getLogger("lm-eval").setLevel(logging.WARNING)
-    lm = HFLM(pretrained=model, tokenizer=tok, batch_size=args.batch_size)
-    out = simple_evaluate(
-        model=lm,
-        tasks=["ifeval"],
-        limit=args.limit,
-        apply_chat_template=chat_template,
-        bootstrap_iters=0,
+    energy_dir = (
+        Path(args.energy_out) / label
+        if args.energy_out
+        else energy_output_dir(args.model, variant)
     )
-    metrics = out["results"]["ifeval"]
+    result = measure_loaded_model(
+        model,
+        tok,
+        gen_tokens=args.gen_tokens,
+        ifeval=True,
+        ifeval_limit=args.limit,
+        ifeval_batch_size=args.batch_size,
+        ifeval_chat_template=chat_template,
+        measure_energy=args.measure_energy,
+        energy_gpu_index=energy_gpu_index,
+        energy_dir=energy_dir,
+        energy_metadata={
+            "model": args.model,
+            "adapter": args.adapter,
+            "variant": variant,
+            "gen_tokens": args.gen_tokens,
+            "chat_template": chat_template,
+        },
+    )
+    result["variant"] = label
+    result["gpu"] = energy_gpu_index
 
-    print("\nIFEval")
+    # Même tableau que benchmark.py (fonction importée), donc colonnes alignées.
+    table_lines = print_table([result], ifeval=True)
+
+    print("\nIFEval (détail)")
     print("-" * 34)
     for name in IFEVAL_METRICS:
-        value = extract_metric(metrics, name)
+        value = _extract_metric(result.get("ifeval", {}), name)
         print(f"{name:26} {value * 100:6.2f}%" if value is not None else f"{name:26}    n/a")
 
-    out_path = Path(args.out) if args.out else Path("results") / (
-        f"ifeval_{'lora' if args.adapter else 'base'}_{datetime.now():%Y%m%d-%H%M%S}.json"
+    out_path = (
+        Path(args.out)
+        if args.out
+        else Path("results") / f"ifeval_{label}_{datetime.now():%Y%m%d-%H%M%S}.json"
     )
     out_path.parent.mkdir(parents=True, exist_ok=True)
     with open(out_path, "w", encoding="utf-8") as f:
@@ -159,7 +224,11 @@ def main():
                 "chat_template": chat_template,
                 "limit": args.limit,
                 "batch_size": args.batch_size,
-                "metrics": metrics,
+                "gen_tokens": args.gen_tokens,
+                "measure_energy": args.measure_energy,
+                "gpu": energy_gpu_index,
+                "result": result,
+                "table": "\n".join(table_lines),
             },
             f,
             indent=2,

@@ -114,6 +114,31 @@ finetuné. Utilise `eval_ifeval.py --adapter ...` (qui applique le template)
 pour mesurer le vrai gain, et `eval_merged_4bit.py` pour comparer au tableau
 de `benchmark.py`.
 
+## Monitoring (énergie, débit, VRAM)
+
+Les deux scripts d'éval importent `measure_loaded_model` de `benchmark.py` —
+la fonction est **partagée, pas recopiée**. Ils produisent donc exactement les
+mêmes colonnes que le tableau de `benchmark.py` :
+
+```
+variant        ppl   VRAM_GB    tok/s  energy_Wh   avg_W   ifeval   gpu
+```
+
+Même chauffe hors mesure (8 tokens de génération + 1 exemple IFEval pour
+amorcer le cache dataset et compiler les kernels), même fenêtre
+`EnergyMeasurement` autour du débit et d'IFEval, mêmes clés dans le JSON
+(`tok_s`, `energy_j`, `energy_wh`, `mean_power_w`, `mean_utilization_pct`,
+`peak_vram_mib`, `mean_vram_mib`, `vram_gb`, `energy_run_dir`).
+
+Options communes : `--gen-tokens`, `--no-energy`, `--energy-gpu-index`,
+`--energy-out`. L'index GPU pour `nvidia-smi` est déduit du premier de
+`CUDA_VISIBLE_DEVICES` par défaut.
+
+Comme IFEval dure plusieurs minutes, la fenêtre de mesure est enfin assez
+longue pour que les watts moyens soient exploitables — contrairement à un run
+`benchmark.py` sans `--ppl` ni `--ifeval`, où le bloc mesuré ne fait que
+quelques secondes.
+
 ## Lien avec `benchmark.py`
 
 `benchmark.py` (racine) compare des **quantifications** du même checkpoint

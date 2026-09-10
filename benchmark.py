@@ -99,10 +99,14 @@ def _extract_metric(metrics, name):
     return None
 
 
-def run_ifeval(model, tok, limit=None, batch_size=4):
+def run_ifeval(model, tok, limit=None, batch_size=4, apply_chat_template=False):
     """Évalue IFEval (instruction-following) sur le modèle déjà chargé, via
     lm-evaluation-harness. Import différé : lm_eval reste optionnel tant
-    qu'on ne passe pas --ifeval."""
+    qu'on ne passe pas --ifeval.
+
+    apply_chat_template : les prompts IFEval sont bruts par défaut. À activer
+    pour un modèle entraîné au format chat (cf. finetuning/), sinon il est
+    hors distribution."""
     import logging
 
     from lm_eval import simple_evaluate
@@ -110,12 +114,98 @@ def run_ifeval(model, tok, limit=None, batch_size=4):
 
     logging.getLogger("lm-eval").setLevel(logging.WARNING)
     lm = HFLM(pretrained=model, tokenizer=tok, batch_size=batch_size)
-    out = simple_evaluate(model=lm, tasks=["ifeval"], limit=limit, bootstrap_iters=0)
+    out = simple_evaluate(
+        model=lm,
+        tasks=["ifeval"],
+        limit=limit,
+        apply_chat_template=apply_chat_template,
+        bootstrap_iters=0,
+    )
     return out["results"]["ifeval"]
 
 
 def energy_output_dir(model_name, variant, base="results/energy"):
     return Path(base) / model_name.replace("/", "_") / variant
+
+
+def measure_loaded_model(
+    model,
+    tok,
+    gen_tokens=128,
+    ppl_enc=None,
+    ifeval=False,
+    ifeval_limit=None,
+    ifeval_batch_size=4,
+    ifeval_chat_template=False,
+    measure_energy=True,
+    energy_gpu_index=0,
+    energy_dir=None,
+    energy_metadata=None,
+):
+    """Chauffe puis mesure débit / perplexité / IFEval / énergie / VRAM sur un
+    modèle DÉJÀ chargé sur le GPU.
+
+    Extrait de run_variant pour que finetuning/ puisse mesurer un modèle LoRA
+    dans exactement les mêmes conditions : même chauffe, même fenêtre
+    d'énergie, mêmes clés de résultat.
+
+    L'appelant doit avoir appelé torch.cuda.reset_peak_memory_stats() AVANT de
+    charger le modèle (pour que vram_gb couvre le chargement), et avoir terminé
+    toute I/O avant l'appel : le bloc mesuré ne doit contenir que du calcul GPU.
+    """
+    # Chauffe hors mesure : le premier appel au modèle compile des kernels et
+    # alloue de la mémoire, ce qui fausserait aussi bien tok/s que la trace
+    # de puissance si on le laissait dans le bloc mesuré.
+    throughput(model, tok, WARMUP_GEN_TOKENS)
+    if ifeval:
+        # Idem pour IFEval : premier appel = téléchargement/chargement du
+        # dataset + compilation. Un seul exemple suffit à chauffer le cache
+        # (le dataset entier est mis en cache local dès ce premier appel).
+        run_ifeval(
+            model,
+            tok,
+            limit=IFEVAL_WARMUP_LIMIT,
+            batch_size=ifeval_batch_size,
+            apply_chat_template=ifeval_chat_template,
+        )
+    torch.cuda.synchronize()
+
+    def _measured(res):
+        res["tok_s"] = throughput(model, tok, gen_tokens)
+        if ppl_enc is not None:
+            res["ppl"] = perplexity(model, ppl_enc)
+        if ifeval:
+            ifeval_metrics = run_ifeval(
+                model,
+                tok,
+                limit=ifeval_limit,
+                batch_size=ifeval_batch_size,
+                apply_chat_template=ifeval_chat_template,
+            )
+            res["ifeval"] = ifeval_metrics
+            res["ifeval_score"] = _extract_metric(ifeval_metrics, "prompt_level_strict_acc")
+
+    result = {}
+    if measure_energy:
+        with EnergyMeasurement(
+            gpu_index=energy_gpu_index,
+            output_dir=energy_dir,
+            metadata=energy_metadata or {},
+        ) as em:
+            _measured(result)
+        result["energy_j"] = em.energy_j
+        result["energy_wh"] = em.energy_j / 3600.0
+        result["mean_power_w"] = em.mean_power_w
+        result["mean_utilization_pct"] = em.mean_utilization_pct
+        result["peak_vram_mib"] = em.peak_vram_mib
+        result["mean_vram_mib"] = em.mean_vram_mib
+        result["energy_run_dir"] = str(em.run_dir)
+    else:
+        _measured(result)
+
+    # Mesuré en dernier : capture le pic mémoire de toute l'évaluation.
+    result["vram_gb"] = torch.cuda.max_memory_allocated() / 1e9
+    return result
 
 
 def run_variant(
@@ -162,52 +252,22 @@ def run_variant(
         if max_tokens:
             ppl_enc.input_ids = ppl_enc.input_ids[:, :max_tokens]
 
-    # Chauffe hors mesure : le premier appel au modèle compile des kernels et
-    # alloue de la mémoire, ce qui fausserait aussi bien tok/s que la trace
-    # de puissance si on le laissait dans le bloc mesuré.
-    throughput(model, tok, WARMUP_GEN_TOKENS)
-    if ifeval:
-        # Idem pour IFEval : premier appel = téléchargement/chargement du
-        # dataset + compilation. Un seul exemple suffit à chauffer le cache
-        # (le dataset entier est mis en cache local dès ce premier appel).
-        run_ifeval(model, tok, limit=IFEVAL_WARMUP_LIMIT, batch_size=ifeval_batch_size)
-    torch.cuda.synchronize()
-
-    def _run_ifeval_and_record(res):
-        ifeval_metrics = run_ifeval(model, tok, limit=ifeval_limit, batch_size=ifeval_batch_size)
-        res["ifeval"] = ifeval_metrics
-        res["ifeval_score"] = _extract_metric(ifeval_metrics, "prompt_level_strict_acc")
-
     result = {"variant": variant}
-
-    if measure_energy:
-        run_dir = energy_dir or energy_output_dir(model_name, variant)
-        with EnergyMeasurement(
-            gpu_index=energy_gpu_index,
-            output_dir=run_dir,
-            metadata={"model": model_name, "variant": variant, "gen_tokens": gen_tokens},
-        ) as em:
-            result["tok_s"] = throughput(model, tok, gen_tokens)
-            if compute_ppl:
-                result["ppl"] = perplexity(model, ppl_enc)
-            if ifeval:
-                _run_ifeval_and_record(result)
-        result["energy_j"] = em.energy_j
-        result["energy_wh"] = em.energy_j / 3600.0
-        result["mean_power_w"] = em.mean_power_w
-        result["mean_utilization_pct"] = em.mean_utilization_pct
-        result["peak_vram_mib"] = em.peak_vram_mib
-        result["mean_vram_mib"] = em.mean_vram_mib
-        result["energy_run_dir"] = str(em.run_dir)
-    else:
-        result["tok_s"] = throughput(model, tok, gen_tokens)
-        if compute_ppl:
-            result["ppl"] = perplexity(model, ppl_enc)
-        if ifeval:
-            _run_ifeval_and_record(result)
-
-    # Mesuré en dernier : capture le pic mémoire de toute l'évaluation (ppl + tok/s + ifeval).
-    result["vram_gb"] = torch.cuda.max_memory_allocated() / 1e9
+    result.update(
+        measure_loaded_model(
+            model,
+            tok,
+            gen_tokens=gen_tokens,
+            ppl_enc=ppl_enc,
+            ifeval=ifeval,
+            ifeval_limit=ifeval_limit,
+            ifeval_batch_size=ifeval_batch_size,
+            measure_energy=measure_energy,
+            energy_gpu_index=energy_gpu_index,
+            energy_dir=energy_dir or energy_output_dir(model_name, variant),
+            energy_metadata={"model": model_name, "variant": variant, "gen_tokens": gen_tokens},
+        )
+    )
 
     del model
     torch.cuda.empty_cache()
