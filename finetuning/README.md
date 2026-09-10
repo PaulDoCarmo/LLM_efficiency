@@ -73,6 +73,47 @@ python finetuning/eval_ifeval.py --limit 100 --adapter finetuning/out/...   # fi
 Le gain réellement attribuable au finetuning, c'est l'écart entre la 3ᵉ ligne
 et la 2ᵉ (même formatage des deux côtés).
 
+## Modèle fusionné en 4bit → IFEval de `benchmark.py`
+
+`eval_merged_4bit.py` fusionne l'adaptateur dans la base, requantifie en 4bit,
+et appelle **le `run_ifeval` de `benchmark.py`** (import direct, pas de copie).
+
+**Dans quoi fusionner ?** C'est le point délicat. Pendant l'entraînement le
+forward est `y = dequant(W_nf4)·x + ΔW·x` : l'adaptateur a appris contre la base
+**quantifiée**, et une partie de ce que `ΔW` encode est la compensation de
+l'erreur de quantification. D'où deux stratégies :
+
+| `--merge-into` | Calcul | |
+|---|---|---|
+| `quantized` (défaut) | `quantize(dequant(W_nf4) + ΔW)` | **Fidèle aux conditions d'entraînement.** PEFT déquantifie, additionne, requantifie couche par couche. Pas de détour par le disque. |
+| `bf16` | `quantize(W + ΔW)` | Fusion dans les poids d'origine. Plus fidèle à `W`, mais pas à ce que l'adaptateur a appris. Passe par le disque (~3 Go temporaires). |
+
+Le défaut `quantized` est le bon choix ; `bf16` est là pour pouvoir comparer les
+deux et mesurer l'écart.
+
+```bash
+# tester le pipeline AVANT la fin de l'entraînement
+python finetuning/eval_merged_4bit.py --dummy --limit 5
+
+# une fois l'entraînement fini
+python finetuning/eval_merged_4bit.py --adapter finetuning/out/qwen2.5-1.5b-qlora-ifeval --limit 100
+```
+
+En `--dummy`, l'adaptateur LoRA est créé non entraîné : sa matrice `B` est
+initialisée à zéro, donc `B@A = 0` et la fusion est un **no-op mathématique**.
+Le score doit donc reproduire celui de la base quantifiée — c'est ce qui rend
+ce mode utile comme vérification, et pas seulement comme test anti-crash.
+
+`--quant-type` : `nf4` (défaut, celle de l'entraînement) ou `fp4` (celle de la
+variante `4bit` de `benchmark.py`, pour une comparaison stricte avec cette
+ligne du tableau).
+
+⚠️ `run_ifeval` de `benchmark.py` n'applique **pas** le chat template, alors
+que le finetuning en utilise un. Le score sera donc pessimiste pour le modèle
+finetuné. Utilise `eval_ifeval.py --adapter ...` (qui applique le template)
+pour mesurer le vrai gain, et `eval_merged_4bit.py` pour comparer au tableau
+de `benchmark.py`.
+
 ## Lien avec `benchmark.py`
 
 `benchmark.py` (racine) compare des **quantifications** du même checkpoint
