@@ -1,6 +1,7 @@
 ﻿--extra-index-url https://download.pytorch.org/whl/cu128
 torch>=2.1
-transformers>=4.44
+transformers>=4.46
+torchao>=0.7          # variante int4 (int4_weight_only)
 datasets>=2.19,<4
 huggingface_hub<1.0
 accelerate>=0.33
