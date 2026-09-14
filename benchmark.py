@@ -122,12 +122,16 @@ def _build_config(variant):
     BitsAndBytesConfig(...) vérifie au constructeur que bitsandbytes est
     installé, donc construire toutes les configs par avance casserait tout
     venv qui n'a pas bitsandbytes (ex: .venv-awq, .venv-gptq)."""
+    # torch_dtype (pas "dtype") : ce nom est valable sur toutes les versions
+    # de transformers utilisées ici (4.47.1 dans .venv-awq jusqu'à 4.57.x dans
+    # le venv principal). "dtype" est le nouveau nom, pas encore reconnu par
+    # les versions plus anciennes qu'exigent certains venvs (autoawq).
     if variant == "fp16":
-        return dict(dtype=torch.float16)
+        return dict(torch_dtype=torch.float16)
     if variant == "bf16":
-        return dict(dtype=torch.bfloat16)
+        return dict(torch_dtype=torch.bfloat16)
     if variant == "int8":
-        return dict(dtype=torch.float16, quantization_config=BitsAndBytesConfig(load_in_8bit=True))
+        return dict(torch_dtype=torch.float16, quantization_config=BitsAndBytesConfig(load_in_8bit=True))
     if variant == "4bit":
         return dict(
             quantization_config=BitsAndBytesConfig(
@@ -137,7 +141,7 @@ def _build_config(variant):
     if variant in PREQUANTIZED_SUFFIXES:
         # Checkpoint déjà quantifié sur disque (config.json du repo) : pas de
         # quantization_config à fournir ici.
-        return dict(dtype="auto")
+        return dict(torch_dtype="auto")
     raise KeyError(variant)
 
 
