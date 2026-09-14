@@ -117,25 +117,32 @@ ARC_DEFAULT_BATCH_SIZE = 16
 ARC_FALLBACK_MAX_LENGTH = 2048
 
 
-def build_configs(selected):
-    all_cfg = {
-        "fp16": dict(dtype=torch.float16),
-        "bf16": dict(dtype=torch.bfloat16),
-        "int8": dict(
-            dtype=torch.float16,
-            quantization_config=BitsAndBytesConfig(load_in_8bit=True),
-        ),
-        "4bit": dict(
+def _build_config(variant):
+    """Construit la config from_pretrained d'UNE variante — jamais les autres :
+    BitsAndBytesConfig(...) vérifie au constructeur que bitsandbytes est
+    installé, donc construire toutes les configs par avance casserait tout
+    venv qui n'a pas bitsandbytes (ex: .venv-awq, .venv-gptq)."""
+    if variant == "fp16":
+        return dict(dtype=torch.float16)
+    if variant == "bf16":
+        return dict(dtype=torch.bfloat16)
+    if variant == "int8":
+        return dict(dtype=torch.float16, quantization_config=BitsAndBytesConfig(load_in_8bit=True))
+    if variant == "4bit":
+        return dict(
             quantization_config=BitsAndBytesConfig(
                 load_in_4bit=True, bnb_4bit_compute_dtype=torch.float16
             )
-        ),
-    }
-    # Checkpoints pré-quantifiés : la quantification est déjà sur disque (dans
-    # le config.json du repo), pas de quantization_config à fournir ici.
-    for variant in PREQUANTIZED_SUFFIXES:
-        all_cfg[variant] = dict(dtype="auto")
-    return {k: all_cfg[k] for k in selected}
+        )
+    if variant in PREQUANTIZED_SUFFIXES:
+        # Checkpoint déjà quantifié sur disque (config.json du repo) : pas de
+        # quantization_config à fournir ici.
+        return dict(dtype="auto")
+    raise KeyError(variant)
+
+
+def build_configs(selected):
+    return {variant: _build_config(variant) for variant in selected}
 
 
 def resolve_model_name(model_name, variant):
