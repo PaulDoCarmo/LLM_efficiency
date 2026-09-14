@@ -217,6 +217,7 @@ def run_variant(
     ifeval=False,
     ifeval_limit=None,
     ifeval_batch_size=4,
+    ifeval_chat_template=False,
     measure_energy=True,
     energy_gpu_index=0,
     energy_dir=None,
@@ -262,6 +263,7 @@ def run_variant(
             ifeval=ifeval,
             ifeval_limit=ifeval_limit,
             ifeval_batch_size=ifeval_batch_size,
+            ifeval_chat_template=ifeval_chat_template,
             measure_energy=measure_energy,
             energy_gpu_index=energy_gpu_index,
             energy_dir=energy_dir or energy_output_dir(model_name, variant),
@@ -295,6 +297,7 @@ def run_variant_subprocess(
     ifeval=False,
     ifeval_limit=None,
     ifeval_batch_size=4,
+    ifeval_chat_template=False,
     measure_energy=True,
     energy_out=None,
 ):
@@ -319,6 +322,8 @@ def run_variant_subprocess(
         if ifeval_limit is not None:
             cmd += ["--ifeval-limit", str(ifeval_limit)]
         cmd += ["--ifeval-batch-size", str(ifeval_batch_size)]
+        if ifeval_chat_template:
+            cmd.append("--ifeval-chat-template")
     if not measure_energy:
         cmd.append("--no-energy")
     if energy_out:
@@ -362,6 +367,7 @@ def run_parallel(
     ifeval=False,
     ifeval_limit=None,
     ifeval_batch_size=4,
+    ifeval_chat_template=False,
     measure_energy=True,
     energy_out=None,
 ):
@@ -386,6 +392,7 @@ def run_parallel(
                 ifeval=ifeval,
                 ifeval_limit=ifeval_limit,
                 ifeval_batch_size=ifeval_batch_size,
+                ifeval_chat_template=ifeval_chat_template,
                 measure_energy=measure_energy,
                 energy_out=energy_out,
             )
@@ -482,6 +489,13 @@ def main():
         help="Batch size pour l'évaluation IFEval.",
     )
     ap.add_argument(
+        "--ifeval-chat-template",
+        action="store_true",
+        help="Applique le chat template aux prompts IFEval (bruts par défaut). "
+        "Indispensable pour un modèle -Instruct ou finetuné au format chat, "
+        "sinon il est hors distribution et le score s'effondre.",
+    )
+    ap.add_argument(
         "--no-energy",
         dest="measure_energy",
         action="store_false",
@@ -521,6 +535,7 @@ def main():
             ifeval=args.ifeval,
             ifeval_limit=args.ifeval_limit,
             ifeval_batch_size=args.ifeval_batch_size,
+            ifeval_chat_template=args.ifeval_chat_template,
             measure_energy=args.measure_energy,
             energy_gpu_index=args.energy_gpu_index if args.energy_gpu_index is not None else 0,
             energy_dir=Path(args.energy_out) / args.worker_variant if args.energy_out else None,
@@ -557,6 +572,7 @@ def main():
                 ifeval=args.ifeval,
                 ifeval_limit=args.ifeval_limit,
                 ifeval_batch_size=args.ifeval_batch_size,
+                ifeval_chat_template=args.ifeval_chat_template,
                 measure_energy=args.measure_energy,
                 energy_out=args.energy_out,
             )
@@ -585,6 +601,7 @@ def main():
                 ifeval=args.ifeval,
                 ifeval_limit=args.ifeval_limit,
                 ifeval_batch_size=args.ifeval_batch_size,
+                ifeval_chat_template=args.ifeval_chat_template,
                 measure_energy=args.measure_energy,
                 energy_gpu_index=seq_energy_gpu_index,
                 energy_dir=Path(args.energy_out) / v if args.energy_out else None,
@@ -619,6 +636,7 @@ def main():
                 "compute_ppl": args.compute_ppl,
                 "ifeval": args.ifeval,
                 "ifeval_limit": args.ifeval_limit,
+                "ifeval_chat_template": args.ifeval_chat_template,
                 "measure_energy": args.measure_energy,
                 "elapsed_s": elapsed,
                 "results": results,
