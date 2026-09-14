@@ -154,6 +154,11 @@ def main() -> None:
         f"Sortie du modele pruned = {test_out.shape[-1]} classes, attendu {len(class_to_idx)}."
     )
 
+    print("=== Evaluation du modele pruned, PAS ENCORE finetune ===")
+    pruned_not_finetuned_results = evaluate(model, device, handle, gpu_name, val_dataset, args)
+    print(f"Pruned (sans finetuning) : top1={pruned_not_finetuned_results['top1_acc']:.4f} "
+          f"top5={pruned_not_finetuned_results['top5_acc']:.4f}")
+
     print(f"=== Finetuning ({args.epochs} epochs, lr={args.lr}, batch_size_train={args.batch_size_train}) ===")
     train_transform = transforms.Compose([
         transforms.RandomResizedCrop(img_size),
@@ -212,6 +217,7 @@ def main() -> None:
             "n_images": baseline_results["n_images"],
         },
         "baseline": {**baseline_results, "params": base_params, "macs": base_macs},
+        "pruned_not_finetuned": {**pruned_not_finetuned_results, "params": pruned_params, "macs": pruned_macs},
         "pruned_finetuned": {**pruned_results, "params": pruned_params, "macs": pruned_macs},
         "summary": {
             "params_reduction_pct": params_reduction_pct,
@@ -220,6 +226,10 @@ def main() -> None:
             "flops_vs_energy_reduction_gap_pct": macs_reduction_pct - energy_reduction_pct,
             "top1_delta_pct_points": (pruned_results["top1_acc"] - baseline_results["top1_acc"]) * 100.0,
             "top5_delta_pct_points": (pruned_results["top5_acc"] - baseline_results["top5_acc"]) * 100.0,
+            "top1_drop_from_pruning_pct_points":
+                (pruned_not_finetuned_results["top1_acc"] - baseline_results["top1_acc"]) * 100.0,
+            "top1_recovered_by_finetuning_pct_points":
+                (pruned_results["top1_acc"] - pruned_not_finetuned_results["top1_acc"]) * 100.0,
             "throughput_speedup_x": pruned_results["throughput_img_s_mean"] / baseline_results["throughput_img_s_mean"],
         },
         "checkpoint_path": str(ckpt_path),
