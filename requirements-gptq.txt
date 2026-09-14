@@ -13,6 +13,10 @@ accelerate>=0.33
 # >=5.4, inutilement plus strict pour ce qu'on en fait ici.
 gptqmodel>=7.0,<7.3.5
 optimum>=1.20  # transformers en a besoin comme pont pour charger un modèle GPTQ
+# gptqmodel importe sans condition tous les modèles qu'il supporte (y compris
+# des modèles vision-langage type InternVL), qui ont besoin de torchvision
+# même si on ne charge que du Qwen2 texte.
+torchvision
 # lm-eval (--ifeval) n'a pas été testé avec transformers>=5.4 — ARC (--arc)
 # n'en dépend pas du tout et est le choix sûr ici. Essayer --ifeval est
 # possible mais peut échouer si lm-eval-harness ne supporte pas encore
