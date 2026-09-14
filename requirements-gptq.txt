@@ -2,7 +2,8 @@
 torch>=2.1
 transformers>=5.4
 datasets>=2.19,<4
-huggingface_hub<1.0
+# Pas de plafond sur huggingface_hub ici (contrairement à requirements.txt/
+# requirements-awq.txt) : transformers>=5.4 exige huggingface-hub>=1.5,<2.0.
 accelerate>=0.33
 # Plafond <7.3.5 : les versions 7.3.5+ demandent transformers>=5.14 au lieu de
 # >=5.4, inutilement plus strict pour ce qu'on en fait ici.
