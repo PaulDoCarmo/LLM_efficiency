@@ -1,5 +1,11 @@
 # Mesure d'énergie GPU
 
+> Utilisé automatiquement par `benchmark.py` (voir
+> [readme_benchmark.md](../readme_benchmark.md)) : chaque variante fp32 /
+> fp16 / int8 / 4bit y est mesurée avec `EnergyMeasurement`, désactivable via
+> `--no-energy`. Les sections ci-dessous restent la référence pour utiliser
+> la classe directement dans un autre script.
+
 ## Installation
 
 ```bash

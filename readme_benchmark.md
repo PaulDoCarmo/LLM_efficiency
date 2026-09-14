@@ -1,9 +1,12 @@
 # quant-bench
 
-Compare un même LLM en **fp32 / fp16 / int8 / 4bit** sur VRAM (pic alloué) et
-débit (tokens/s), avec en option la perplexité (WikiText-2) et IFEval
-(instruction-following, via `lm-evaluation-harness`). Si plusieurs GPUs sont
-visibles, les variantes tournent en parallèle, une par GPU.
+Compare un même LLM en **fp16 / bf16 / int8 / 4bit** sur VRAM (pic alloué),
+débit (tokens/s) et **énergie consommée** (via
+[`energy_measurement`](energy_measurement/README.md), activée par défaut),
+avec en option la perplexité (WikiText-2), IFEval (instruction-following,
+via `lm-evaluation-harness`) et ARC-Challenge (raisonnement scientifique,
+scoring par log-vraisemblance). Si plusieurs GPUs sont visibles, les variantes
+tournent en parallèle, une par GPU.
 
 ## Installation
 
@@ -33,8 +36,14 @@ python benchmark.py --model Qwen/Qwen2.5-1.5B --ifeval
 # IFEval sous-échantillonné, pour un aperçu rapide (score moins fiable)
 python benchmark.py --model Qwen/Qwen2.5-1.5B --ifeval --ifeval-limit 40
 
+# + ARC-Challenge (1172 questions du split test, ~1 min/variante)
+python benchmark.py --model Qwen/Qwen2.5-1.5B --arc --arc-batch-size 16
+
 # sous-ensemble de variantes
 python benchmark.py --model meta-llama/Llama-3.2-1B --variants fp16 4bit
+
+# désactiver la mesure d'énergie (itération rapide, ou GPU non libre)
+python benchmark.py --model Qwen/Qwen2.5-1.5B --no-energy
 ```
 
 ### Multi-GPU
@@ -51,32 +60,53 @@ Voir [Parallélisation](#parallélisation-multi-gpu) plus bas.
 | Flag | Défaut | Effet |
 |---|---|---|
 | `--model` | `Qwen/Qwen2.5-1.5B` | Modèle HF à évaluer |
-| `--variants` | les 4 | Sous-ensemble parmi `fp32 fp16 int8 4bit` |
+| `--variants` | les 4 | Sous-ensemble parmi `fp16 bf16 int8 4bit` |
 | `--ppl` | désactivé | Calcule la perplexité sur WikiText-2 (test) |
 | `--max-tokens` | `0` (tout) | Tronque le texte d'éval ppl à N tokens |
 | `--ifeval` | désactivé | Calcule IFEval via lm-evaluation-harness |
 | `--ifeval-limit` | tous (541) | Sous-échantillonne IFEval pour aller plus vite |
-| `--ifeval-batch-size` | `4` | Batch size pour la génération IFEval |
+| `--ifeval-batch-size` | `auto` | Batch size pour la génération IFEval (`auto` = calibré hors mesure) |
+| `--arc` | désactivé | Calcule ARC-Challenge par log-vraisemblance |
+| `--arc-limit` | tout (1172) | Sous-échantillonne ARC pour aller plus vite |
+| `--arc-batch-size` | `16` | Séquences scorées par forward ARC. **Fixe**, jamais `auto` |
 | `--gen-tokens` | `128` | Longueur de génération pour la mesure de débit |
 | `--gpus` | `CUDA_VISIBLE_DEVICES` ou tous | GPUs physiques à utiliser en parallèle |
 | `--sequential` | auto | Force l'exécution séquentielle (désactive le multi-GPU) |
 | `--out` | `results/<model>_<timestamp>.json` | Fichier de résultats |
+| `--no-energy` | désactivé (mesure activée par défaut) | Coupe la mesure d'énergie (`EnergyMeasurement`) |
+| `--energy-gpu-index` | premier GPU de `--gpus` | Index physique nvidia-smi à surveiller, en séquentiel seulement |
+| `--energy-out` | `results/energy/<model>/<variant>/` | Dossier racine des traces d'énergie |
 
-Sortie console type (avec `--ppl --ifeval`) :
+Sortie console type (avec `--ppl --ifeval --arc`) :
 
 ```
-variant        ppl   VRAM_GB    tok/s   ifeval   gpu
-------------------------------------------------------
-fp32        10.213      8.81     34.9     54.3%   0
-fp16        10.212      6.28     34.3     53.8%   1
-int8        10.278      4.97      8.6     52.9%   2
-4bit        11.837      4.40     24.6     47.5%   4
+variant        ppl   VRAM_GB    tok/s  energy_Wh   avg_W   ifeval  arc_norm   gpu
+--------------------------------------------------------------------------------------
+fp16        10.212      6.28     34.3      0.301     174    53.8%     45.1%   0
+bf16        10.213      6.28     34.6      0.298     175    54.1%     45.1%   1
+int8        10.278      4.97      8.6      0.256     146    52.9%     42.7%   2
+4bit        11.837      4.40     24.6      0.198     139    47.5%     40.2%   4
 ```
+
+La colonne `arc_norm` est `acc_norm` (la métrique principale d'ARC), pas
+l'accuracy brute — les deux sont dans le JSON.
 
 ## Méthode
 
 - **VRAM** — `torch.cuda.max_memory_allocated()`, mesuré après toute
   l'évaluation de la variante (débit + ppl + IFEval si activés).
+- **Énergie** (activée par défaut, `--no-energy` pour désactiver) — chaque
+  variante charge son modèle, fait une petite génération de chauffe hors
+  mesure (et, si `--ifeval`, un passage IFEval à 1 exemple pour mettre en
+  cache le dataset et compiler les kernels), puis le débit, la perplexité
+  (si `--ppl`) **et IFEval (si `--ifeval`)** tournent tous ensemble sous
+  [`EnergyMeasurement`](energy_measurement/README.md) : joules intégrés sur
+  la trace `nvidia-smi` réelle, watts moyens, utilisation GPU, VRAM. IFEval
+  étant le plus long des trois (541 prompts par défaut), c'est aussi lui qui
+  donne la fenêtre de mesure la plus fiable (voir "Bloc d'au moins 60
+  secondes recommandé" dans `energy_measurement/README.md`). Chaque variante
+  écrit sa trace dans `results/energy/<model>/<variant>/<timestamp>/`
+  (`power_trace.csv`, `energy_timeseries.csv`, `summary.json`).
 - **Débit** — génération greedy de 128 tokens, `synchronize()` autour du chrono.
 - **Perplexité** (`--ppl`) — fenêtre glissante sur WikiText-2 test (stride 512,
   contexte 2048), seuls les nouveaux tokens de chaque fenêtre sont scorés.
@@ -85,7 +115,47 @@ int8        10.278      4.97      8.6     52.9%   2
 - **IFEval** (`--ifeval`) — instruction-following, via `lm_eval.simple_evaluate`
   sur le modèle déjà chargé (pas de rechargement). Métrique reportée :
   `prompt_level_strict_acc`. Le détail complet (les 4 sous-métriques IFEval) est
-  conservé dans le JSON de sortie sous `results[].ifeval`.
+  conservé dans le JSON de sortie sous `results[].ifeval`. Compté dans la
+  mesure d'énergie (voir "Énergie" ci-dessus) : seul le premier exemple
+  (chauffe du cache dataset) est exclu, tout le reste — génération sur les
+  541 prompts (ou `--ifeval-limit`) — est dans la fenêtre mesurée.
+- **ARC-Challenge** (`--arc`) — raisonnement scientifique, `allenai/ai2_arc`,
+  config `ARC-Challenge`, **split `test` uniquement** (1172 questions ; ni
+  train ni validation, l'éval est 0-shot). Implémenté directement dans
+  `benchmark.py` plutôt que délégué au harness, pour pouvoir compter les
+  forwards (voir plus bas) et sortir des erreurs-types ; les scores sont
+  vérifiés identiques à ceux de `lm_eval` sur la tâche `arc_challenge`.
+  Détails du protocole :
+  - **Scoring par log-vraisemblance, pas par génération.** Pour chaque
+    question on construit une séquence par option — prompt
+    `Question: {question}\nAnswer:` suivi du **texte** de l'option
+    (`choices.text`), jamais de sa lettre — et on prend l'argmax de la
+    log-vraisemblance de la continuation.
+  - Le nombre d'options n'est **pas** supposé égal à 4 : le split contient
+    des questions à 3 et à 5 options, l'argmax est pris sur les options de
+    la question courante.
+  - `answerKey` est tantôt une lettre (`"A"`..`"E"`), tantôt un chiffre
+    (`"1"`..`"5"`) : la bonne option est résolue par recherche dans
+    `choices.label`, jamais en décodant la lettre.
+  - Métriques : `acc` (log-vraisemblance brute) et **`acc_norm`** (divisée
+    par la longueur en **octets** du texte de l'option) — `acc_norm` est la
+    métrique principale, c'est elle que reporte `arc_score` et la colonne
+    `arc_norm`. Erreur-type binomiale `sqrt(p(1-p)/n)` pour les deux.
+  - `--arc-batch-size` est un entier **fixe**, jamais calibré
+    automatiquement contrairement à `--ifeval-batch-size` : c'est une
+    variable expérimentale, garde-la identique entre variantes. Les
+    séquences sont scorées dans l'ordre du dataset, sans tri par longueur,
+    pour que le nombre et la forme des forwards soient reproductibles.
+  - La tokenisation de tout le dataset est faite **hors** du bloc mesuré
+    (comme celle de WikiText-2) ; seuls les forwards du scoring y tombent,
+    précédés d'une question de chauffe hors mesure.
+  - Le JSON de sortie contient `arc_forward_passes` (unité de travail GPU
+    d'ARC, puisqu'il n'y a aucune génération) et `energy_per_forward_pass_j`
+    pour la normalisation énergétique. ⚠️ Si `--ifeval` et `--arc` tournent
+    dans le même run, `energy_per_token_j` et `energy_per_forward_pass_j`
+    attribuent chacun **toute** l'énergie du bloc : ils ne sont pas
+    additifs. Pour un coût énergétique net par tâche, fais un run par
+    benchmark.
 
 ## Parallélisation multi-GPU
 
@@ -101,10 +171,31 @@ classique dans le process principal — utile pour debug avec `--sequential`).
   bloquer les autres.
 - `logs/` et `results/` sont dans `.gitignore` (générés, pas versionnés).
 
+## Tests
+
+```bash
+.venv/bin/python tests/test_arc_challenge.py
+```
+
+Vérifie le chargement d'ARC-Challenge (split `test`, 1172 items) et le
+parsing d'`answerKey` dans ses deux formats. Ni GPU ni modèle requis.
+
 ⚠️ En parallèle, `tok/s` est moins fiable pour comparer les variantes entre
 elles : les 4 sous-process se partagent des ressources hôte (CPU, PCIe), ce
 qui compresse les écarts de débit réels. Pour un chiffre de débit rigoureux,
 relance avec `--sequential`.
+
+⚠️ `EnergyMeasurement` exige un GPU **libre** (aucun autre process dessus) au
+moment d'entrer dans le bloc mesuré — voir
+[energy_measurement/README.md](energy_measurement/README.md). En parallèle
+chaque sous-process cible automatiquement son propre GPU physique
+(`CUDA_VISIBLE_DEVICES` par variante), donc c'est transparent. En séquentiel
+avec plusieurs GPUs visibles, la mesure d'énergie ne surveille que le premier
+(`--energy-gpu-index` pour en choisir un autre) puisque tout tourne dans le
+même process sur un seul device à la fois. Un run court (peu de tokens, pas
+de `--ppl`) donne aussi une fenêtre de mesure très brève : la puissance
+moyenne est alors plus bruitée (voir "Bloc d'au moins 60 secondes recommandé"
+dans `energy_measurement/README.md`).
 
 ## À savoir sur l'A100
 
@@ -115,9 +206,13 @@ relance avec `--sequential`.
   `--ifeval` complet.
 - **fp8** n'est pas inclus : pas de tensor cores FP8 sur Ampere (Hopper/H100
   requis). En weight-only il tournerait mais sans gain de vitesse.
-- **fp32 vs fp16** : perplexité quasi identique, parfois strictement égale sur
-  un petit modèle. fp32 sert surtout de baseline « pleine précision » ; le
-  contraste net se voit surtout en 4bit.
+- **bf16 vs fp16** : Qwen (comme la plupart des LLM récents) est entraîné et
+  publié en **bf16** — c'est sa précision native, pas fp32. bf16 sert donc de
+  vraie baseline « pleine précision fidèle à l'entraînement » ; fp16 est une
+  conversion de format (mantisse réduite, mais surtout exposant plus étroit
+  que bf16/fp32), ce qui peut en théorie faire déborder des activations à
+  large dynamique. En pratique, sur un petit modèle, la perplexité des deux
+  reste quasi identique — le contraste net se voit surtout en 4bit.
 
 ## Machine(s) utilisée(s)
 
@@ -134,6 +229,12 @@ relance avec `--sequential`.
 - `--max-tokens` : réduit fortement le temps d'éval ppl (utile pour itérer).
 - `--ifeval-limit` : idem pour IFEval (541 prompts par défaut, sous-échantillonne
   pour un score approximatif plus rapide).
+- `--arc-limit` : idem pour ARC-Challenge (1172 questions par défaut). ARC est
+  bien plus rapide qu'IFEval (pas de génération) : ~1 min par variante sur le
+  split complet, un sous-échantillonnage est rarement nécessaire.
+- `--arc-batch-size` : à faire varier volontairement pour étudier l'effet du
+  batch sur l'énergie — mais constant à l'intérieur d'une comparaison de
+  variantes.
 - `--gen-tokens` : longueur de génération pour la mesure de débit.
 - Modèles conseillés (petits, dispos partout) : `Qwen/Qwen2.5-0.5B`,
   `Qwen/Qwen2.5-1.5B`, `meta-llama/Llama-3.2-1B`, `google/gemma-2-2b`.
