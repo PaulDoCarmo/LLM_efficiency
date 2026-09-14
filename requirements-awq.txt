@@ -1,5 +1,8 @@
 --extra-index-url https://download.pytorch.org/whl/cu128
-torch>=2.1
+# Pinné à la même version que le venv principal : torch>=2.1 seul laisse pip
+# choisir la dernière version dispo, qui embarque des libs CUDA 13.x
+# incompatibles avec le driver de la VM (supporte jusqu'à CUDA 12.8).
+torch==2.11.0+cu128
 transformers>=4.45,<=4.47.1
 datasets>=2.19,<4
 huggingface_hub<1.0
