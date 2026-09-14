@@ -17,6 +17,7 @@ optimum>=1.20  # transformers en a besoin comme pont pour charger un modèle GPT
 # des modèles vision-langage type InternVL), qui ont besoin de torchvision
 # même si on ne charge que du Qwen2 texte.
 torchvision
+ninja  # requis pour la compilation JIT du noyau Marlin de gptqmodel
 # lm-eval (--ifeval) n'a pas été testé avec transformers>=5.4 — ARC (--arc)
 # n'en dépend pas du tout et est le choix sûr ici. Essayer --ifeval est
 # possible mais peut échouer si lm-eval-harness ne supporte pas encore
