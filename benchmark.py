@@ -164,8 +164,12 @@ def run_ifeval(model, tok, limit=None, batch_size=4, log_samples=False):
 
     logging.getLogger("lm-eval").setLevel(logging.WARNING)
     lm = HFLM(pretrained=model, tokenizer=tok, batch_size=batch_size)
+    # apply_chat_template : sans ça, même un modèle Instruct reçoit le prompt
+    # en complétion brute au lieu du format conversationnel qu'il attend, et
+    # ne sait pas quand s'arrêter (voir le taux de réponses plafonnées).
     out = simple_evaluate(
-        model=lm, tasks=["ifeval"], limit=limit, bootstrap_iters=0, log_samples=log_samples
+        model=lm, tasks=["ifeval"], limit=limit, bootstrap_iters=0,
+        log_samples=log_samples, apply_chat_template=True,
     )
     samples = out["samples"]["ifeval"] if log_samples else None
     return out["results"]["ifeval"], samples
