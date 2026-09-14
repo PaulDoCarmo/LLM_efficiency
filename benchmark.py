@@ -17,6 +17,7 @@ Usage:
     CUDA_VISIBLE_DEVICES=0,1,2,4 python benchmark.py   # 4 variantes en parallèle, une par GPU
     python benchmark.py --ifeval --ifeval-limit 40     # + score IFEval (sous-échantillonné)
     python benchmark.py --arc --arc-batch-size 16      # + score ARC-Challenge (log-vraisemblance)
+    python benchmark.py --arc --arc-chat-template      # ARC avec prompts au format ChatML
     python benchmark.py --ppl                          # + perplexité WikiText-2
     python benchmark.py --variants gptq-int8 gptq-int4 awq --ifeval
         # checkpoints pré-quantifiés hors ligne (repo HF = --model + suffixe,
@@ -103,6 +104,12 @@ ARC_PROMPT_TEMPLATE = "Question: {question}\nAnswer:"
 # target_delimiter de lm-evaluation-harness, pour que les scores restent
 # comparables à ceux du harness.
 ARC_TARGET_DELIMITER = " "
+# Message système FIXÉ pour --arc-chat-template, au lieu du défaut du
+# tokenizer : Qwen2.5 base et Instruct n'ont pas le même défaut ("You are a
+# helpful assistant." contre "You are Qwen, created by Alibaba Cloud. You are
+# a helpful assistant."), ce qui rendrait deux modèles non comparables sur le
+# même benchmark. À garder identique entre tous les runs qu'on compare.
+ARC_CHAT_SYSTEM_PROMPT = "You are a helpful assistant."
 ARC_WARMUP_LIMIT = 1  # chauffe hors mesure, même rôle que IFEVAL_WARMUP_LIMIT.
 ARC_DEFAULT_BATCH_SIZE = 16
 # Repli si le modèle n'expose pas de longueur de contexte. Les séquences ARC
@@ -273,6 +280,20 @@ def _arc_context(doc):
     return ARC_PROMPT_TEMPLATE.format(question=doc["question"])
 
 
+def _arc_chat_context(doc, tok):
+    """Contexte au format ChatML : la question dans un tour utilisateur, puis
+    l'en-tête du tour assistant, que l'option vient compléter.
+
+    Le template se termine par un saut de ligne (ex. "<|im_start|>assistant\n"),
+    donc AUCUN délimiteur n'est ajouté avant l'option — contrairement au format
+    complétion où une espace sépare "Answer:" du texte."""
+    messages = [
+        {"role": "system", "content": ARC_CHAT_SYSTEM_PROMPT},
+        {"role": "user", "content": doc["question"]},
+    ]
+    return tok.apply_chat_template(messages, tokenize=False, add_generation_prompt=True)
+
+
 def _encode_arc_pair(tok, context, continuation):
     """(tokens du contexte, tokens de la continuation) pour un modèle causal.
 
@@ -284,23 +305,36 @@ def _encode_arc_pair(tok, context, continuation):
     return ctx, whole[len(ctx):]
 
 
-def prepare_arc_requests(tok, docs):
+def prepare_arc_requests(tok, docs, chat_template=False):
     """Pré-tokenise toutes les paires (question, option) AVANT le bloc mesuré.
 
     Une question produit autant de séquences qu'elle a d'options — 3, 4 ou 5
     selon les items, jamais supposé égal à 4.
 
+    Si chat_template, le prompt passe par le template de chat du tokenizer
+    (ChatML pour Qwen) au lieu du format complétion — voir _arc_chat_context.
+    Les séquences sont alors nettement plus longues (≈ +25 tokens par option
+    sur Qwen2.5), ce qui augmente la VRAM du forward à batch égal.
+
     Séparé de run_arc pour la même raison que la tokenisation de WikiText-2 :
     c'est du travail CPU, le laisser dans le bloc EnergyMeasurement diluerait
     la puissance moyenne avec du temps GPU inactif."""
+    if chat_template and getattr(tok, "chat_template", None) is None:
+        raise ValueError(
+            "--arc-chat-template demandé mais ce tokenizer n'expose aucun "
+            "template de chat."
+        )
     encoded, byte_lens, n_choices, golds = [], [], [], []
     for doc in docs:
-        context = _arc_context(doc)
+        context = _arc_chat_context(doc, tok) if chat_template else _arc_context(doc)
+        delimiter = "" if chat_template else ARC_TARGET_DELIMITER
         texts = doc["choices"]["text"]
         for text in texts:
-            encoded.append(_encode_arc_pair(tok, context, ARC_TARGET_DELIMITER + text))
+            encoded.append(_encode_arc_pair(tok, context, delimiter + text))
             # acc_norm normalise par la longueur en OCTETS du texte de l'option,
-            # délimiteur exclu, pour ne pas favoriser les options courtes (dont
+            # délimiteur et prompt exclus — le format du prompt ne change pas
+            # la réponse à normaliser. Pour ne pas favoriser les options
+            # courtes (dont
             # la log-vraisemblance, somme de termes négatifs, est mécaniquement
             # plus haute).
             byte_lens.append(len(text.encode("utf-8")))
@@ -441,6 +475,7 @@ def run_variant(
     arc=False,
     arc_limit=None,
     arc_batch_size=ARC_DEFAULT_BATCH_SIZE,
+    arc_chat_template=False,
     measure_energy=True,
     energy_gpu_index=0,
     energy_dir=None,
@@ -486,7 +521,9 @@ def run_variant(
 
     arc_requests = None
     if arc:
-        arc_requests = prepare_arc_requests(tok, load_arc_challenge(limit=arc_limit))
+        arc_requests = prepare_arc_requests(
+            tok, load_arc_challenge(limit=arc_limit), chat_template=arc_chat_template
+        )
 
     # Chauffe hors mesure : le premier appel au modèle compile des kernels et
     # alloue de la mémoire, ce qui fausserait aussi bien tok/s que la trace
@@ -545,6 +582,9 @@ def run_variant(
         # c'est une variable expérimentale (décision figée), elle doit rester
         # identique d'une variante à l'autre pour que la comparaison tienne.
         res["arc_batch_size_used"] = arc_batch_size
+        # Format du prompt : complétion ou ChatML. Change les scores autant que
+        # la quantization, donc jamais comparer deux runs qui diffèrent dessus.
+        res["arc_chat_template"] = arc_chat_template
         # Unité de travail GPU d'ARC (le scoring ne génère rien) : sert à
         # normaliser l'énergie, comme les tokens générés pour IFEval.
         res["arc_forward_passes"] = arc_metrics["forward_passes"]
@@ -630,6 +670,7 @@ def run_variant_subprocess(
     arc=False,
     arc_limit=None,
     arc_batch_size=ARC_DEFAULT_BATCH_SIZE,
+    arc_chat_template=False,
     measure_energy=True,
     energy_out=None,
 ):
@@ -659,6 +700,8 @@ def run_variant_subprocess(
         if arc_limit is not None:
             cmd += ["--arc-limit", str(arc_limit)]
         cmd += ["--arc-batch-size", str(arc_batch_size)]
+        if arc_chat_template:
+            cmd.append("--arc-chat-template")
     if not measure_energy:
         cmd.append("--no-energy")
     if energy_out:
@@ -707,6 +750,7 @@ def run_parallel(
     arc=False,
     arc_limit=None,
     arc_batch_size=ARC_DEFAULT_BATCH_SIZE,
+    arc_chat_template=False,
     measure_energy=True,
     energy_out=None,
 ):
@@ -734,6 +778,7 @@ def run_parallel(
                 arc=arc,
                 arc_limit=arc_limit,
                 arc_batch_size=arc_batch_size,
+                arc_chat_template=arc_chat_template,
                 measure_energy=measure_energy,
                 energy_out=energy_out,
             )
@@ -863,6 +908,15 @@ def main():
         "identique entre variantes pour que les comparaisons tiennent.",
     )
     ap.add_argument(
+        "--arc-chat-template",
+        action="store_true",
+        help="Formate les prompts ARC avec le template de chat du tokenizer "
+        "(ChatML pour Qwen) au lieu du format complétion 'Question: ...\\nAnswer:'. "
+        "Pensé pour un modèle instruct. Attention : allonge les séquences "
+        "(≈ +25 tokens/option sur Qwen2.5), donc augmente la VRAM à batch égal, "
+        "et les scores ne sont PAS comparables à ceux d'un run en complétion.",
+    )
+    ap.add_argument(
         "--no-energy",
         dest="measure_energy",
         action="store_false",
@@ -905,6 +959,7 @@ def main():
             arc=args.arc,
             arc_limit=args.arc_limit,
             arc_batch_size=args.arc_batch_size,
+            arc_chat_template=args.arc_chat_template,
             measure_energy=args.measure_energy,
             energy_gpu_index=args.energy_gpu_index if args.energy_gpu_index is not None else 0,
             energy_dir=Path(args.energy_out) / args.worker_variant if args.energy_out else None,
@@ -944,6 +999,7 @@ def main():
                 arc=args.arc,
                 arc_limit=args.arc_limit,
                 arc_batch_size=args.arc_batch_size,
+                arc_chat_template=args.arc_chat_template,
                 measure_energy=args.measure_energy,
                 energy_out=args.energy_out,
             )
@@ -975,6 +1031,7 @@ def main():
                 arc=args.arc,
                 arc_limit=args.arc_limit,
                 arc_batch_size=args.arc_batch_size,
+                arc_chat_template=args.arc_chat_template,
                 measure_energy=args.measure_energy,
                 energy_gpu_index=seq_energy_gpu_index,
                 energy_dir=Path(args.energy_out) / v if args.energy_out else None,
@@ -1012,6 +1069,7 @@ def main():
                 "arc": args.arc,
                 "arc_limit": args.arc_limit,
                 "arc_batch_size": args.arc_batch_size,
+                "arc_chat_template": args.arc_chat_template,
                 "measure_energy": args.measure_energy,
                 "elapsed_s": elapsed,
                 "results": results,
