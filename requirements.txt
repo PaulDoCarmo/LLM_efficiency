@@ -5,7 +5,8 @@ datasets>=2.19,<4
 huggingface_hub<1.0
 accelerate>=0.33
 bitsandbytes>=0.43
-gptqmodel>=1.4  # variantes gptq-int8/gptq-int4 (checkpoints pré-quantifiés) — successeur maintenu d'auto-gptq
+gptqmodel>=7.0,<8  # variantes gptq-int8/gptq-int4 — successeur maintenu d'auto-gptq. Plancher 7.0 : les
+                    # versions <7.0 (ex: 6.0.3) ont un setup.py cassé (import 'pcre' fantôme).
 autoawq>=0.2    # variante awq (checkpoint pré-quantifié)
 lm-eval[ifeval]>=0.4.4
 numpy
