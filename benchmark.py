@@ -1,6 +1,6 @@
 #!/usr/bin/env python
 """Compare un LLM en fp16 / bf16 / int8 / 4bit : VRAM, débit, et en option
-perplexité / IFEval.
+perplexité / IFEval / ARC-Challenge.
 
 VRAM = pic alloué. tok/s = génération greedy de 128 tokens. Perplexité (--ppl,
 désactivée par défaut) calculée sur WikiText-2 (test). Pensé pour un GPU
@@ -16,10 +16,12 @@ Usage:
     python benchmark.py --model meta-llama/Llama-3.2-1B --variants fp16 4bit --max-tokens 4000
     CUDA_VISIBLE_DEVICES=0,1,2,4 python benchmark.py   # 4 variantes en parallèle, une par GPU
     python benchmark.py --ifeval --ifeval-limit 40     # + score IFEval (sous-échantillonné)
+    python benchmark.py --arc --arc-batch-size 16      # + score ARC-Challenge (log-vraisemblance)
     python benchmark.py --ppl                          # + perplexité WikiText-2
 """
 import argparse
 import json
+import math
 import os
 import shutil
 import subprocess
@@ -63,6 +65,26 @@ IFEVAL_GEN_TOKEN_CAP = 2048
 # plus gros que ce calibrage.
 IFEVAL_CALIBRATION_GEN_TOKENS = 256
 IFEVAL_BATCH_SAFETY_MARGIN = 0.5
+
+# ARC-Challenge : split test UNIQUEMENT (ni train ni validation — l'éval est
+# 0-shot, il n'y a donc aucun exemple few-shot à tirer). Scoring par
+# log-vraisemblance et jamais par génération : pour chaque question on score
+# une séquence par option et on prend l'argmax (voir run_arc).
+ARC_DATASET_PATH = "allenai/ai2_arc"
+ARC_DATASET_NAME = "ARC-Challenge"
+ARC_SPLIT = "test"
+ARC_TEST_SIZE = 1172  # taille attendue du split test (vérifiée par tests/test_arc_challenge.py)
+ARC_PROMPT_TEMPLATE = "Question: {question}\nAnswer:"
+# La continuation scorée est le TEXTE de l'option (choices.text), pas la
+# lettre A/B/C/D, précédé d'une espace : même convention que le
+# target_delimiter de lm-evaluation-harness, pour que les scores restent
+# comparables à ceux du harness.
+ARC_TARGET_DELIMITER = " "
+ARC_WARMUP_LIMIT = 1  # chauffe hors mesure, même rôle que IFEVAL_WARMUP_LIMIT.
+ARC_DEFAULT_BATCH_SIZE = 16
+# Repli si le modèle n'expose pas de longueur de contexte. Les séquences ARC
+# font ~100 tokens : la troncature ne se déclenche jamais en pratique.
+ARC_FALLBACK_MAX_LENGTH = 2048
 
 
 def build_configs(selected):
@@ -185,6 +207,189 @@ def _ifeval_generated_token_counts(samples, tok):
     return [len(tok(s["resps"][0][0], add_special_tokens=False).input_ids) for s in samples]
 
 
+def load_arc_challenge(limit=None):
+    """Charge le split test d'ARC-Challenge (ARC_TEST_SIZE items).
+
+    Seul split chargé, volontairement : l'éval est 0-shot, donc ni train ni
+    validation ne servent (pas d'exemples few-shot à tirer)."""
+    docs = load_dataset(ARC_DATASET_PATH, ARC_DATASET_NAME, split=ARC_SPLIT)
+    if limit is not None:
+        docs = docs.select(range(min(limit, len(docs))))
+    return docs
+
+
+def arc_gold_index(doc):
+    """Index, dans choices.text, de la bonne option.
+
+    answerKey est tantôt une lettre ("A".."E"), tantôt un chiffre ("1".."5")
+    selon le document. On ne décode donc jamais la clé : on la cherche dans
+    choices.label, qui suit toujours la même convention qu'answerKey au sein
+    d'un même document (vérifié sur les 1172 items du split test)."""
+    labels = [str(label).strip() for label in doc["choices"]["label"]]
+    key = str(doc["answerKey"]).strip()
+    if key not in labels:
+        raise ValueError(
+            f"answerKey {key!r} absent de choices.label {labels} (doc {doc.get('id')!r})."
+        )
+    return labels.index(key)
+
+
+def _arc_context(doc):
+    return ARC_PROMPT_TEMPLATE.format(question=doc["question"])
+
+
+def _encode_arc_pair(tok, context, continuation):
+    """(tokens du contexte, tokens de la continuation) pour un modèle causal.
+
+    On encode contexte+continuation d'un bloc puis on coupe à la longueur du
+    contexte seul : encoder les deux séparément casserait les fusions de
+    tokens à la frontière. Même approche que lm-evaluation-harness."""
+    whole = tok(context + continuation, add_special_tokens=False).input_ids
+    ctx = tok(context, add_special_tokens=False).input_ids
+    return ctx, whole[len(ctx):]
+
+
+def prepare_arc_requests(tok, docs):
+    """Pré-tokenise toutes les paires (question, option) AVANT le bloc mesuré.
+
+    Une question produit autant de séquences qu'elle a d'options — 3, 4 ou 5
+    selon les items, jamais supposé égal à 4.
+
+    Séparé de run_arc pour la même raison que la tokenisation de WikiText-2 :
+    c'est du travail CPU, le laisser dans le bloc EnergyMeasurement diluerait
+    la puissance moyenne avec du temps GPU inactif."""
+    encoded, byte_lens, n_choices, golds = [], [], [], []
+    for doc in docs:
+        context = _arc_context(doc)
+        texts = doc["choices"]["text"]
+        for text in texts:
+            encoded.append(_encode_arc_pair(tok, context, ARC_TARGET_DELIMITER + text))
+            # acc_norm normalise par la longueur en OCTETS du texte de l'option,
+            # délimiteur exclu, pour ne pas favoriser les options courtes (dont
+            # la log-vraisemblance, somme de termes négatifs, est mécaniquement
+            # plus haute).
+            byte_lens.append(len(text.encode("utf-8")))
+        n_choices.append(len(texts))
+        golds.append(arc_gold_index(doc))
+    return {
+        "encoded": encoded,
+        "byte_lens": byte_lens,
+        "n_choices": n_choices,
+        "golds": golds,
+    }
+
+
+def _arc_head(requests, n_docs):
+    """Les n_docs premières questions d'un jeu de requêtes déjà préparé."""
+    n_choices = requests["n_choices"][:n_docs]
+    n_seq = sum(n_choices)
+    return {
+        "encoded": requests["encoded"][:n_seq],
+        "byte_lens": requests["byte_lens"][:n_seq],
+        "n_choices": n_choices,
+        "golds": requests["golds"][:n_docs],
+    }
+
+
+@torch.no_grad()
+def _arc_loglikelihoods(model, tok, encoded, batch_size, max_length):
+    """Log-vraisemblance totale de chaque continuation sachant son contexte.
+
+    Un forward par batch, de taille FIXE (jamais adaptée à la VRAM : c'est une
+    variable expérimentale, voir --arc-batch-size). Les séquences sont
+    traitées dans l'ordre du dataset, sans tri par longueur, pour que le
+    nombre et la forme des forwards soient identiques d'une variante à
+    l'autre.
+
+    Renvoie (log-vraisemblances, nombre de forwards effectués)."""
+    pad_id = tok.pad_token_id if tok.pad_token_id is not None else (tok.eos_token_id or 0)
+    lls = []
+    forward_passes = 0
+
+    for start in range(0, len(encoded), batch_size):
+        chunk = encoded[start : start + batch_size]
+        # Le dernier token n'a pas de cible : on donne au modèle ctx+cont
+        # amputé de son dernier token et on lit la distribution prédite pour
+        # chaque token de la continuation.
+        seqs = [(ctx + cont)[-max_length:][:-1] for ctx, cont in chunk]
+        width = max(len(s) for s in seqs)
+        # Padding à DROITE : l'attention causale empêche les vrais tokens, tous
+        # alignés à gauche, de voir le padding — les logits qu'on lit sont donc
+        # identiques à ceux d'un forward sans padding.
+        input_ids = torch.full((len(seqs), width), pad_id, dtype=torch.long)
+        attn = torch.zeros((len(seqs), width), dtype=torch.long)
+        for i, seq in enumerate(seqs):
+            input_ids[i, : len(seq)] = torch.tensor(seq, dtype=torch.long)
+            attn[i, : len(seq)] = 1
+
+        logits = model(
+            input_ids=input_ids.to(model.device), attention_mask=attn.to(model.device)
+        ).logits
+        forward_passes += 1
+
+        for i, (_ctx, cont) in enumerate(chunk):
+            # Les len(cont) dernières positions de seqs[i] prédisent exactement
+            # les tokens de la continuation.
+            end = len(seqs[i])
+            # log_softmax sur la seule tranche utile : le faire sur tout le
+            # batch coûterait un tenseur float32 de taille batch x width x vocab.
+            logprobs = torch.log_softmax(logits[i, end - len(cont) : end, :].float(), dim=-1)
+            targets = torch.tensor(cont, dtype=torch.long, device=logprobs.device)
+            lls.append(logprobs.gather(-1, targets.unsqueeze(-1)).sum().item())
+
+    return lls, forward_passes
+
+
+def _binomial_stderr(p, n):
+    """Erreur-type binomiale d'une proportion mesurée sur n items."""
+    return math.sqrt(p * (1.0 - p) / n) if n > 0 else None
+
+
+def run_arc(model, tok, requests, batch_size=ARC_DEFAULT_BATCH_SIZE):
+    """Évalue ARC-Challenge sur le modèle déjà chargé, par log-vraisemblance.
+
+    `requests` vient de prepare_arc_requests : tout est déjà tokenisé, aucune
+    I/O ici, la fonction est faite pour tourner dans le bloc mesuré par
+    EnergyMeasurement.
+
+    Deux métriques, l'argmax étant pris sur les options de CETTE question
+    (3, 4 ou 5, jamais supposé) :
+    - acc      : argmax de la log-vraisemblance brute ;
+    - acc_norm : argmax de la log-vraisemblance divisée par la longueur en
+                 octets du texte de l'option — c'est la métrique principale.
+
+    Renvoie un dict de métriques, enrichi du nombre de forwards effectués
+    (pour la normalisation énergétique)."""
+    max_length = (
+        getattr(model.config, "max_position_embeddings", None) or ARC_FALLBACK_MAX_LENGTH
+    )
+    lls, forward_passes = _arc_loglikelihoods(
+        model, tok, requests["encoded"], batch_size, max_length
+    )
+
+    byte_lens, golds = requests["byte_lens"], requests["golds"]
+    correct = correct_norm = 0
+    offset = 0
+    for gold, k in zip(golds, requests["n_choices"]):
+        window = lls[offset : offset + k]
+        normed = [ll / b for ll, b in zip(window, byte_lens[offset : offset + k])]
+        correct += int(max(range(k), key=window.__getitem__) == gold)
+        correct_norm += int(max(range(k), key=normed.__getitem__) == gold)
+        offset += k
+
+    n = len(golds)
+    acc, acc_norm = correct / n, correct_norm / n
+    return {
+        "acc": acc,
+        "acc_stderr": _binomial_stderr(acc, n),
+        "acc_norm": acc_norm,
+        "acc_norm_stderr": _binomial_stderr(acc_norm, n),
+        "n": n,
+        "sequences_scored": len(lls),
+        "forward_passes": forward_passes,
+    }
+
+
 def energy_output_dir(model_name, variant, base="results/energy"):
     return Path(base) / model_name.replace("/", "_") / variant
 
@@ -198,6 +403,9 @@ def run_variant(
     ifeval=False,
     ifeval_limit=None,
     ifeval_batch_size="auto",
+    arc=False,
+    arc_limit=None,
+    arc_batch_size=ARC_DEFAULT_BATCH_SIZE,
     measure_energy=True,
     energy_gpu_index=0,
     energy_dir=None,
@@ -205,15 +413,18 @@ def run_variant(
     """Charge tokenizer+modèle et évalue UNE variante. Suppose que
     CUDA_VISIBLE_DEVICES est déjà positionné correctement par l'appelant.
 
-    Si measure_energy est activé, le débit, la perplexité (si demandée) et
-    IFEval (si demandé) tournent tous sous EnergyMeasurement, sur
-    `energy_gpu_index` (index PHYSIQUE nvidia-smi du GPU réellement utilisé
-    par ce process — voir le README de energy_measurement/). Comme
+    Si measure_energy est activé, le débit, la perplexité (si demandée),
+    IFEval et ARC-Challenge (si demandés) tournent tous sous
+    EnergyMeasurement, sur `energy_gpu_index` (index PHYSIQUE nvidia-smi du
+    GPU réellement utilisé par ce process — voir le README de
+    energy_measurement/). Comme
     lm-evaluation-harness télécharge/charge son dataset et compile des
     kernels de génération au premier appel, un passage IFEval "à vide" (un
     seul exemple) est fait hors mesure juste avant, uniquement pour chauffer
     ce cache — le run IFEval réel (celui compté dans les résultats) a lieu
-    dans le bloc mesuré."""
+    dans le bloc mesuré. Même principe pour ARC-Challenge : dataset chargé et
+    intégralement tokenisé hors mesure, puis une question de chauffe, et seuls
+    les forwards du scoring réel tombent dans le bloc mesuré."""
     tok = AutoTokenizer.from_pretrained(model_name)
 
     cfg = build_configs([variant])[variant]
@@ -233,6 +444,10 @@ def run_variant(
         if max_tokens:
             ppl_enc.input_ids = ppl_enc.input_ids[:, :max_tokens]
 
+    arc_requests = None
+    if arc:
+        arc_requests = prepare_arc_requests(tok, load_arc_challenge(limit=arc_limit))
+
     # Chauffe hors mesure : le premier appel au modèle compile des kernels et
     # alloue de la mémoire, ce qui fausserait aussi bien tok/s que la trace
     # de puissance si on le laissait dans le bloc mesuré.
@@ -247,6 +462,10 @@ def run_variant(
         # dataset + compilation. Un seul exemple suffit à chauffer le cache
         # (le dataset entier est mis en cache local dès ce premier appel).
         run_ifeval(model, tok, limit=IFEVAL_WARMUP_LIMIT, batch_size=ifeval_batch_size)  # (metrics, None)
+    if arc:
+        # Idem : le premier forward compile des kernels. Une seule question
+        # (ARC_WARMUP_LIMIT) suffit, le dataset est déjà tokenisé au-dessus.
+        run_arc(model, tok, _arc_head(arc_requests, ARC_WARMUP_LIMIT), batch_size=arc_batch_size)
     torch.cuda.synchronize()
 
     def _run_ifeval_and_record(res):
@@ -272,6 +491,27 @@ def run_variant(
         res["ifeval_elapsed_s"] = ifeval_elapsed_s
         res["ifeval_time_per_token_s"] = ifeval_elapsed_s / total_tokens
 
+    def _run_arc_and_record(res):
+        t0 = time.time()
+        arc_metrics = run_arc(model, tok, arc_requests, batch_size=arc_batch_size)
+        arc_elapsed_s = time.time() - t0
+        res["arc"] = arc_metrics
+        # Métrique principale d'ARC-Challenge : acc_norm (log-vraisemblance
+        # normalisée par la longueur de l'option), pas l'accuracy brute.
+        res["arc_score"] = arc_metrics["acc_norm"]
+        res["arc_acc"] = arc_metrics["acc"]
+        res["arc_acc_norm"] = arc_metrics["acc_norm"]
+        # Batch fixe, jamais calibré automatiquement, contrairement à IFEval :
+        # c'est une variable expérimentale (décision figée), elle doit rester
+        # identique d'une variante à l'autre pour que la comparaison tienne.
+        res["arc_batch_size_used"] = arc_batch_size
+        # Unité de travail GPU d'ARC (le scoring ne génère rien) : sert à
+        # normaliser l'énergie, comme les tokens générés pour IFEval.
+        res["arc_forward_passes"] = arc_metrics["forward_passes"]
+        res["arc_sequences_scored"] = arc_metrics["sequences_scored"]
+        res["arc_elapsed_s"] = arc_elapsed_s
+        res["arc_time_per_forward_s"] = arc_elapsed_s / arc_metrics["forward_passes"]
+
     result = {"variant": variant}
 
     if measure_energy:
@@ -286,6 +526,8 @@ def run_variant(
                 result["ppl"] = perplexity(model, ppl_enc)
             if ifeval:
                 _run_ifeval_and_record(result)
+            if arc:
+                _run_arc_and_record(result)
         result["energy_j"] = em.energy_j
         result["energy_wh"] = em.energy_j / 3600.0
         result["mean_power_w"] = em.mean_power_w
@@ -298,14 +540,25 @@ def run_variant(
             # (WARMUP_GEN_TOKENS tokens, négligeable face aux ~541 prompts
             # IFEval) — attribué ici entièrement à IFEval plutôt que réparti.
             result["energy_per_token_j"] = result["energy_j"] / result["ifeval_total_tokens"]
+        if result.get("arc_forward_passes"):
+            # Même approximation : toute l'énergie du bloc est attribuée à ARC.
+            # Si --ifeval et --arc tournent ensemble, les deux ratios comptent
+            # chacun l'énergie totale — ils ne sont alors pas additifs, et il
+            # faut un run par benchmark pour un coût énergétique par tâche net.
+            result["energy_per_forward_pass_j"] = (
+                result["energy_j"] / result["arc_forward_passes"]
+            )
     else:
         result["tok_s"] = throughput(model, tok, gen_tokens)
         if compute_ppl:
             result["ppl"] = perplexity(model, ppl_enc)
         if ifeval:
             _run_ifeval_and_record(result)
+        if arc:
+            _run_arc_and_record(result)
 
-    # Mesuré en dernier : capture le pic mémoire de toute l'évaluation (ppl + tok/s + ifeval).
+    # Mesuré en dernier : capture le pic mémoire de toute l'évaluation
+    # (ppl + tok/s + ifeval + arc).
     result["vram_gb"] = torch.cuda.max_memory_allocated() / 1e9
 
     del model
@@ -334,6 +587,9 @@ def run_variant_subprocess(
     ifeval=False,
     ifeval_limit=None,
     ifeval_batch_size="auto",
+    arc=False,
+    arc_limit=None,
+    arc_batch_size=ARC_DEFAULT_BATCH_SIZE,
     measure_energy=True,
     energy_out=None,
 ):
@@ -358,6 +614,11 @@ def run_variant_subprocess(
         if ifeval_limit is not None:
             cmd += ["--ifeval-limit", str(ifeval_limit)]
         cmd += ["--ifeval-batch-size", str(ifeval_batch_size)]
+    if arc:
+        cmd.append("--arc")
+        if arc_limit is not None:
+            cmd += ["--arc-limit", str(arc_limit)]
+        cmd += ["--arc-batch-size", str(arc_batch_size)]
     if not measure_energy:
         cmd.append("--no-energy")
     if energy_out:
@@ -381,6 +642,8 @@ def run_variant_subprocess(
         extra += f" energy={result['energy_wh']:.3f}Wh ({result['mean_power_w']:.0f}W moy.)"
     if result.get("ifeval_score") is not None:
         extra += f" ifeval={result['ifeval_score'] * 100:.1f}%"
+    if result.get("arc_score") is not None:
+        extra += f" arc={result['arc_score'] * 100:.1f}%"
     print(
         f"[{variant}] terminé sur GPU {gpu_id} : "
         f"vram={result['vram_gb']:.2f}GB tok/s={result['tok_s']:.1f}{extra}",
@@ -401,6 +664,9 @@ def run_parallel(
     ifeval=False,
     ifeval_limit=None,
     ifeval_batch_size="auto",
+    arc=False,
+    arc_limit=None,
+    arc_batch_size=ARC_DEFAULT_BATCH_SIZE,
     measure_energy=True,
     energy_out=None,
 ):
@@ -425,6 +691,9 @@ def run_parallel(
                 ifeval=ifeval,
                 ifeval_limit=ifeval_limit,
                 ifeval_batch_size=ifeval_batch_size,
+                arc=arc,
+                arc_limit=arc_limit,
+                arc_batch_size=arc_batch_size,
                 measure_energy=measure_energy,
                 energy_out=energy_out,
             )
@@ -435,10 +704,12 @@ def run_parallel(
         return list(ex.map(worker, variants))
 
 
-def print_table(results, ifeval=False):
+def print_table(results, ifeval=False, arc=False):
     header = f"\n{'variant':8} {'ppl':>9} {'VRAM_GB':>9} {'tok/s':>8} {'energy_Wh':>10} {'avg_W':>7}"
     if ifeval:
         header += f" {'ifeval':>8}"
+    if arc:
+        header += f" {'arc_norm':>9}"
     header += "   gpu"
     print(header)
     print("-" * (len(header) + 4))
@@ -460,6 +731,9 @@ def print_table(results, ifeval=False):
             if ifeval:
                 score = r.get("ifeval_score")
                 line += f" {score * 100:7.1f}%" if score is not None else f" {'n/a':>8}"
+            if arc:
+                score = r.get("arc_score")
+                line += f" {score * 100:8.1f}%" if score is not None else f" {'n/a':>9}"
             line += f"   {r.get('gpu', '-')}"
         print(line)
         lines.append(line)
@@ -524,6 +798,27 @@ def main():
         "pour le run réel (voir find_max_ifeval_batch_size).",
     )
     ap.add_argument(
+        "--arc",
+        action="store_true",
+        help="Évalue aussi ARC-Challenge (raisonnement scientifique, split test, "
+        "1172 questions) par log-vraisemblance — pas de génération.",
+    )
+    ap.add_argument(
+        "--arc-limit",
+        type=int,
+        default=None,
+        help="Limite le nombre de questions ARC (défaut: tout le split test, 1172).",
+    )
+    ap.add_argument(
+        "--arc-batch-size",
+        type=int,
+        default=ARC_DEFAULT_BATCH_SIZE,
+        help=f"Nombre de séquences scorées par forward pour ARC (défaut: "
+        f"{ARC_DEFAULT_BATCH_SIZE}). Entier FIXE, jamais 'auto' contrairement à "
+        "--ifeval-batch-size : c'est une variable expérimentale, garde-la "
+        "identique entre variantes pour que les comparaisons tiennent.",
+    )
+    ap.add_argument(
         "--no-energy",
         dest="measure_energy",
         action="store_false",
@@ -563,6 +858,9 @@ def main():
             ifeval=args.ifeval,
             ifeval_limit=args.ifeval_limit,
             ifeval_batch_size=args.ifeval_batch_size,
+            arc=args.arc,
+            arc_limit=args.arc_limit,
+            arc_batch_size=args.arc_batch_size,
             measure_energy=args.measure_energy,
             energy_gpu_index=args.energy_gpu_index if args.energy_gpu_index is not None else 0,
             energy_dir=Path(args.energy_out) / args.worker_variant if args.energy_out else None,
@@ -599,6 +897,9 @@ def main():
                 ifeval=args.ifeval,
                 ifeval_limit=args.ifeval_limit,
                 ifeval_batch_size=args.ifeval_batch_size,
+                arc=args.arc,
+                arc_limit=args.arc_limit,
+                arc_batch_size=args.arc_batch_size,
                 measure_energy=args.measure_energy,
                 energy_out=args.energy_out,
             )
@@ -627,6 +928,9 @@ def main():
                 ifeval=args.ifeval,
                 ifeval_limit=args.ifeval_limit,
                 ifeval_batch_size=args.ifeval_batch_size,
+                arc=args.arc,
+                arc_limit=args.arc_limit,
+                arc_batch_size=args.arc_batch_size,
                 measure_energy=args.measure_energy,
                 energy_gpu_index=seq_energy_gpu_index,
                 energy_dir=Path(args.energy_out) / v if args.energy_out else None,
@@ -640,7 +944,7 @@ def main():
     order = {v: i for i, v in enumerate(args.variants)}
     results.sort(key=lambda r: order.get(r["variant"], 999))
 
-    table_lines = print_table(results, ifeval=args.ifeval)
+    table_lines = print_table(results, ifeval=args.ifeval, arc=args.arc)
     print(f"\ntemps total: {elapsed:.1f}s")
 
     out_path = (
@@ -661,6 +965,9 @@ def main():
                 "compute_ppl": args.compute_ppl,
                 "ifeval": args.ifeval,
                 "ifeval_limit": args.ifeval_limit,
+                "arc": args.arc,
+                "arc_limit": args.arc_limit,
+                "arc_batch_size": args.arc_batch_size,
                 "measure_energy": args.measure_energy,
                 "elapsed_s": elapsed,
                 "results": results,
