@@ -10,11 +10,14 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from benchmark import (  # noqa: E402
+    ARC_CHAT_SYSTEM_PROMPT,
     ARC_SPLIT,
     ARC_TEST_SIZE,
+    _arc_chat_context,
     _arc_context,
     arc_gold_index,
     load_arc_challenge,
+    prepare_arc_requests,
 )
 
 # Chargé une seule fois : le split test entier sert à plusieurs tests.
@@ -113,6 +116,41 @@ def test_prompt_format():
     """Prompt 0-shot, sans exemple ni lettre d'option."""
     doc = {"question": "Why is the sky blue?"}
     assert _arc_context(doc) == "Question: Why is the sky blue?\nAnswer:"
+
+
+def test_chat_context_uses_pinned_system_prompt():
+    """Le message système est figé dans le code, jamais celui par défaut du
+    tokenizer : Qwen2.5 base et Instruct n'ont pas le même, ce qui rendrait
+    deux modèles non comparables."""
+    from transformers import AutoTokenizer
+
+    doc = {"question": "Why is the sky blue?"}
+    tok = AutoTokenizer.from_pretrained("Qwen/Qwen2.5-1.5B-Instruct")
+    ctx = _arc_chat_context(doc, tok)
+
+    assert ARC_CHAT_SYSTEM_PROMPT in ctx
+    assert "created by Alibaba Cloud" not in ctx  # le défaut du tokenizer Instruct
+    assert doc["question"] in ctx
+    # Se termine par l'en-tête du tour assistant, donc l'option se colle sans
+    # délimiteur (contrairement au format complétion).
+    assert ctx.endswith("<|im_start|>assistant\n")
+
+
+def test_chat_context_adds_no_leading_space():
+    """En ChatML l'option ne doit PAS être précédée d'une espace : le contexte
+    finit déjà par un saut de ligne."""
+    from transformers import AutoTokenizer
+
+    tok = AutoTokenizer.from_pretrained("Qwen/Qwen2.5-1.5B-Instruct")
+    docs = load_arc_challenge(limit=2)
+    plain = prepare_arc_requests(tok, docs)
+    chat = prepare_arc_requests(tok, docs, chat_template=True)
+
+    assert len(chat["encoded"]) == len(plain["encoded"])
+    assert chat["byte_lens"] == plain["byte_lens"]  # acc_norm inchangé
+    # Le prompt ChatML est plus long, donc chaque séquence aussi.
+    for (pc, pk), (cc, ck) in zip(plain["encoded"], chat["encoded"]):
+        assert len(cc) > len(pc)
 
 
 if __name__ == "__main__":

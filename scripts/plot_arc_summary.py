@@ -1,12 +1,16 @@
 """Figures ARC-Challenge : performance et énergie par variante, pour chaque
 batch size, plus une comparaison entre les deux batches.
 
-Deux runs complets (4 variantes × 1172 questions) sont attendus, l'un à batch
-2, l'autre à batch 256 — voir RUNS ci-dessous.
+Attend deux runs complets du MÊME modèle, différant uniquement par le batch.
+Le modèle, les batches et le nombre de questions sont lus dans les JSON : rien
+n'est codé en dur, les figures sont nommées d'après le modèle pour que deux
+modèles ne s'écrasent pas.
 
-    .venv/bin/python scripts/plot_arc_summary.py
+    python3 scripts/plot_arc_summary.py
+    python3 scripts/plot_arc_summary.py --runs results/<run_a>.json results/<run_b>.json
 """
 from pathlib import Path
+import argparse
 import json
 
 import matplotlib
@@ -14,11 +18,11 @@ matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 
 ROOT = Path(__file__).resolve().parents[1]
-RUNS = {
-    2: ROOT / "results" / "Qwen_Qwen2.5-1.5B_20260910-154320.json",
-    256: ROOT / "results" / "Qwen_Qwen2.5-1.5B_20260910-153034.json",
-}
-MODEL = "Qwen/Qwen2.5-1.5B"
+# Paire par défaut : le modèle de base, batch 2 et batch 256.
+DEFAULT_RUNS = [
+    ROOT / "results" / "Qwen_Qwen2.5-1.5B_20260910-154320.json",
+    ROOT / "results" / "Qwen_Qwen2.5-1.5B_20260910-153034.json",
+]
 
 # Palette de référence (mode clair), slots catégoriels 1 et 2. Validée :
 # ΔE CVD 24.7, vision normale 33.6, contraste ≥ 3:1 sur la surface.
@@ -91,7 +95,7 @@ def figure_par_batch(batch, data, out_path):
     norm = [r["arc"]["acc_norm"] for r in results]
     norm_err = [r["arc"]["acc_norm_stderr"] for r in results]
 
-    fig, axes = plt.subplots(2, 2, figsize=(11, 8), dpi=200, constrained_layout=True)
+    fig, axes = plt.subplots(2, 3, figsize=(16, 8), dpi=200, constrained_layout=True)
 
     # Deux séries (acc et acc_norm) : la couleur porte l'identité, légende requise.
     ax = axes[0][0]
@@ -106,7 +110,7 @@ def figure_par_batch(batch, data, out_path):
            yerr=norm_err, ecolor=INK_2, capsize=3, error_kw={"linewidth": 1})
     ax.set_xticks(list(xs))
     ax.set_xticklabels(variants)
-    ax.set_title("Justesse ARC-Challenge (1172 questions)", color=INK, pad=8)
+    ax.set_title(f"Justesse ARC-Challenge ({results[0]['arc']['n']} questions)", color=INK, pad=8)
     ax.set_ylabel("Proportion de bonnes réponses")
     ax.set_ylim(0, 0.62)
     label_bars(ax, left, acc, lambda v: f"{v:.1%}", 0.022)
@@ -116,14 +120,19 @@ def figure_par_batch(batch, data, out_path):
 
     bar_panel(axes[0][1], variants, [r["energy_j"] for r in results],
               "Énergie consommée sur le bloc mesuré", "joules", lambda v: f"{v:,.0f}".replace(",", " "))
+    # Temps du scoring ARC seul, hors chargement du modèle et hors chauffe.
+    bar_panel(axes[0][2], variants, [r["arc_elapsed_s"] for r in results],
+              "Temps d'inférence ARC", "secondes", lambda v: f"{v:.0f} s")
     bar_panel(axes[1][0], variants, [r["mean_power_w"] for r in results],
               "Puissance moyenne", "watts", lambda v: f"{v:.0f}")
     bar_panel(axes[1][1], variants, [r["mean_utilization_pct"] for r in results],
               "Utilisation GPU moyenne", "%", lambda v: f"{v:.0f}")
+    bar_panel(axes[1][2], variants, [r["vram_gb"] for r in results],
+              "VRAM, pic alloué par torch", "Go", lambda v: f"{v:.1f}")
 
     fwd = results[0]["arc_forward_passes"]
     dur = f"{min(r['arc_elapsed_s'] for r in results):.0f}–{max(r['arc_elapsed_s'] for r in results):.0f} s"
-    fig.suptitle(f"{MODEL} — ARC-Challenge, batch {batch}", fontsize=14, color=INK)
+    fig.suptitle(f"{data['model']} — ARC-Challenge, batch {batch}", fontsize=14, color=INK)
     fig.text(0.5, -0.015,
              f"{fwd} forwards par variante · bloc mesuré {dur} · barres d'erreur = erreur-type binomiale",
              ha="center", fontsize=8.5, color=MUTED)
@@ -138,7 +147,7 @@ def figure_comparaison(runs, out_path):
     colors = {batches[0]: SERIES_1, batches[1]: SERIES_2}
     by = {b: {r["variant"]: r for r in runs[b]["results"]} for b in batches}
 
-    fig, axes = plt.subplots(2, 2, figsize=(11, 8), dpi=200, constrained_layout=True)
+    fig, axes = plt.subplots(2, 3, figsize=(16, 8), dpi=200, constrained_layout=True)
     xs = list(range(len(variants)))
 
     # Valeurs très proches et incertitude à montrer : points + barres d'erreur,
@@ -179,13 +188,21 @@ def figure_comparaison(runs, out_path):
 
     grouped(axes[0][1], "energy_j", "Énergie — le batch change tout",
             "joules", lambda v: f"{v:,.0f}".replace(",", " "))
+    grouped(axes[0][2], "arc_elapsed_s", "Temps d'inférence ARC", "secondes", lambda v: f"{v:.0f}")
     grouped(axes[1][0], "mean_power_w", "Puissance moyenne", "watts", lambda v: f"{v:.0f}")
     grouped(axes[1][1], "mean_utilization_pct", "Utilisation GPU moyenne", "%", lambda v: f"{v:.0f}")
+    grouped(axes[1][2], "vram_gb", "VRAM, pic alloué par torch", "Go", lambda v: f"{v:.1f}")
 
-    fig.suptitle(f"{MODEL} — ARC-Challenge, batch 2 contre batch 256", fontsize=14, color=INK)
+    ref = runs[batches[0]]["results"][0]["arc"]
+    ratio = batches[1] // batches[0]
+    fig.suptitle(
+        f"{runs[batches[0]]['model']} — ARC-Challenge, batch {batches[0]} contre batch {batches[1]}",
+        fontsize=14, color=INK,
+    )
     fig.text(0.5, -0.015,
-             "Même travail utile dans les deux cas : 1172 questions, 4687 séquences. "
-             "L'énergie par forward n'est pas comparable entre batches (un forward à 256 fait 128× plus de travail).",
+             f"Même travail utile dans les deux cas : {ref['n']} questions, {ref['sequences_scored']} séquences. "
+             f"L'énergie par forward n'est pas comparable entre batches "
+             f"(un forward à {batches[1]} fait {ratio}× plus de travail).",
              ha="center", fontsize=8.5, color=MUTED)
     fig.savefig(out_path, bbox_inches="tight", facecolor=SURFACE)
     plt.close(fig)
@@ -193,11 +210,27 @@ def figure_comparaison(runs, out_path):
 
 
 def main():
-    runs = {b: load(p) for b, p in RUNS.items()}
-    for b, data in runs.items():
-        assert data["arc_batch_size"] == b, f"batch attendu {b}, trouvé {data['arc_batch_size']}"
-        figure_par_batch(b, data, ROOT / "results" / f"arc_batch{b}_summary.png")
-    figure_comparaison(runs, ROOT / "results" / "arc_batch_comparison.png")
+    ap = argparse.ArgumentParser(description=__doc__)
+    ap.add_argument("--runs", nargs=2, type=Path, default=DEFAULT_RUNS,
+                    help="Les deux JSON de résultats à comparer (même modèle, batches différents).")
+    args = ap.parse_args()
+
+    runs = {}
+    for path in args.runs:
+        data = load(path)
+        batch = data["arc_batch_size"]
+        assert data.get("arc"), f"{path.name} n'est pas un run ARC"
+        assert batch not in runs, f"les deux runs ont le même batch ({batch})"
+        runs[batch] = data
+
+    models = {d["model"] for d in runs.values()}
+    assert len(models) == 1, f"les deux runs doivent porter sur le même modèle : {models}"
+    # Préfixe tiré du modèle : sans lui, deux modèles écriraient les mêmes PNG.
+    prefix = models.pop().replace("/", "_")
+
+    for batch, data in sorted(runs.items()):
+        figure_par_batch(batch, data, ROOT / "results" / f"arc_{prefix}_batch{batch}_summary.png")
+    figure_comparaison(runs, ROOT / "results" / f"arc_{prefix}_comparison.png")
 
 
 if __name__ == "__main__":
