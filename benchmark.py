@@ -1,6 +1,6 @@
 #!/usr/bin/env python
 """Compare un LLM en fp16 / bf16 / int8 / 4bit : VRAM, débit, et en option
-perplexité / IFEval.
+perplexité / IFEval / ARC-Challenge.
 
 VRAM = pic alloué. tok/s = génération greedy de 128 tokens. Perplexité (--ppl,
 désactivée par défaut) calculée sur WikiText-2 (test). Pensé pour un GPU
@@ -16,10 +16,17 @@ Usage:
     python benchmark.py --model meta-llama/Llama-3.2-1B --variants fp16 4bit --max-tokens 4000
     CUDA_VISIBLE_DEVICES=0,1,2,4 python benchmark.py   # 4 variantes en parallèle, une par GPU
     python benchmark.py --ifeval --ifeval-limit 40     # + score IFEval (sous-échantillonné)
+    python benchmark.py --arc --arc-batch-size 16      # + score ARC-Challenge (log-vraisemblance)
     python benchmark.py --ppl                          # + perplexité WikiText-2
+    python benchmark.py --variants gptq-int8 gptq-int4 awq --ifeval
+        # checkpoints pré-quantifiés hors ligne (repo HF = --model + suffixe,
+        # ex: "<model>-GPTQ-Int8") au lieu d'une quantification bitsandbytes
+        # à la volée — nécessite que ce checkpoint existe pour --model, et
+        # auto-gptq/autoawq installés.
 """
 import argparse
 import json
+import math
 import os
 import shutil
 import subprocess
@@ -48,9 +55,59 @@ sys.path.insert(0, str(Path(__file__).parent / "energy_measurement"))
 from energy_measurement import EnergyMeasurement  # noqa: E402
 
 ALL_VARIANTS = ["fp16", "bf16", "int8", "4bit"]
+# Checkpoints déjà quantifiés hors ligne (calibrés une fois, pas à la volée au
+# chargement) — contrairement à int8/4bit ci-dessus qui sont quantifiés par
+# bitsandbytes au moment du from_pretrained. Suffixe ajouté au nom du modèle
+# demandé (--model), suivant la convention Qwen (ex: "Qwen/Qwen2.5-1.5B-
+# Instruct" -> "Qwen/Qwen2.5-1.5B-Instruct-GPTQ-Int8"). Nécessite le
+# checkpoint correspondant publié pour le modèle choisi, et le backend GPTQ
+# (auto-gptq) ou AWQ (autoawq) installé — voir requirements.txt.
+PREQUANTIZED_SUFFIXES = {
+    "gptq-int8": "-GPTQ-Int8",
+    "gptq-int4": "-GPTQ-Int4",
+    "awq": "-AWQ",
+}
+# Défaut : remplace les variantes quantifiées à la volée par bitsandbytes
+# (int8, 4bit) par leurs équivalents pré-quantifiés hors ligne. gptq-int4 ET
+# awq sont gardés ensemble (même largeur 4 bits, deux algorithmes différents
+# à comparer). bitsandbytes int8/4bit restent utilisables via --variants
+# explicite, pour comparer quantification à la volée vs hors ligne.
+DEFAULT_VARIANTS = ["fp16", "bf16", "gptq-int8", "gptq-int4", "awq"]
 FORBIDDEN_GPUS = {"3"}  # GPU 3 hors limites sur cette machine, ne jamais l'utiliser.
 WARMUP_GEN_TOKENS = 8  # chauffe hors mesure, avant d'entrer dans EnergyMeasurement.
 IFEVAL_WARMUP_LIMIT = 1  # idem, pour chauffer le cache dataset IFEval + compiler les kernels.
+# Plafond de génération de la tâche IFEval dans lm-evaluation-harness (constaté
+# via le warning HF "max_new_tokens (=2048)"). Ne pas y toucher : une réponse
+# qui l'atteint n'a pas fini de générer, on ne sait pas ce qu'elle aurait dit
+# ensuite — ça ne doit pas être confondu avec une vraie mesure de verbosité.
+# À revérifier si la version de lm_eval change.
+IFEVAL_GEN_TOKEN_CAP = 2048
+# Calibrage --ifeval-batch-size=auto : génération plus courte que le pire cas
+# réel (IFEVAL_GEN_TOKEN_CAP) pour rester rapide, marge de sécurité ensuite
+# appliquée car les vraies réponses IFEval peuvent remplir un KV-cache bien
+# plus gros que ce calibrage.
+IFEVAL_CALIBRATION_GEN_TOKENS = 256
+IFEVAL_BATCH_SAFETY_MARGIN = 0.5
+
+# ARC-Challenge : split test UNIQUEMENT (ni train ni validation — l'éval est
+# 0-shot, il n'y a donc aucun exemple few-shot à tirer). Scoring par
+# log-vraisemblance et jamais par génération : pour chaque question on score
+# une séquence par option et on prend l'argmax (voir run_arc).
+ARC_DATASET_PATH = "allenai/ai2_arc"
+ARC_DATASET_NAME = "ARC-Challenge"
+ARC_SPLIT = "test"
+ARC_TEST_SIZE = 1172  # taille attendue du split test (vérifiée par tests/test_arc_challenge.py)
+ARC_PROMPT_TEMPLATE = "Question: {question}\nAnswer:"
+# La continuation scorée est le TEXTE de l'option (choices.text), pas la
+# lettre A/B/C/D, précédé d'une espace : même convention que le
+# target_delimiter de lm-evaluation-harness, pour que les scores restent
+# comparables à ceux du harness.
+ARC_TARGET_DELIMITER = " "
+ARC_WARMUP_LIMIT = 1  # chauffe hors mesure, même rôle que IFEVAL_WARMUP_LIMIT.
+ARC_DEFAULT_BATCH_SIZE = 16
+# Repli si le modèle n'expose pas de longueur de contexte. Les séquences ARC
+# font ~100 tokens : la troncature ne se déclenche jamais en pratique.
+ARC_FALLBACK_MAX_LENGTH = 2048
 
 
 def build_configs(selected):
@@ -67,7 +124,19 @@ def build_configs(selected):
             )
         ),
     }
+    # Checkpoints pré-quantifiés : la quantification est déjà sur disque (dans
+    # le config.json du repo), pas de quantization_config à fournir ici.
+    for variant in PREQUANTIZED_SUFFIXES:
+        all_cfg[variant] = dict(dtype="auto")
     return {k: all_cfg[k] for k in selected}
+
+
+def resolve_model_name(model_name, variant):
+    """Nom du repo HF à charger pour cette variante : le modèle demandé tel
+    quel, sauf pour les checkpoints pré-quantifiés qui vivent dans un repo à
+    part (voir PREQUANTIZED_SUFFIXES)."""
+    suffix = PREQUANTIZED_SUFFIXES.get(variant)
+    return f"{model_name}{suffix}" if suffix else model_name
 
 
 @torch.no_grad()
@@ -91,6 +160,44 @@ def throughput(model, tok, n=128):
     return (out.size(1) - ids.size(1)) / (time.time() - t0)
 
 
+def find_max_ifeval_batch_size(model, tok, max_batch=256):
+    """Calibre le plus grand batch qui tient dans la VRAM libre, par
+    doublement (1, 2, 4, ...), avant d'entrer dans le bloc mesuré. Le
+    résultat est ensuite utilisé comme batch EXPLICITE et FIXE pour le run
+    réel (décision figée : jamais 'auto' pendant la mesure elle-même, voir
+    CLAUDE.md) — seul ce calibrage, hors mesure, est adaptatif."""
+    prompt_ids = tok(
+        "Write a detailed, step-by-step explanation of how photosynthesis works.",
+        return_tensors="pt",
+    ).input_ids
+
+    best = 1
+    batch = 1
+    while batch <= max_batch:
+        try:
+            torch.cuda.empty_cache()
+            ids = prompt_ids.repeat(batch, 1).to(model.device)
+            with torch.no_grad():
+                model.generate(ids, max_new_tokens=IFEVAL_CALIBRATION_GEN_TOKENS, do_sample=False)
+            torch.cuda.synchronize()
+            best = batch
+            batch *= 2
+        except torch.cuda.OutOfMemoryError:
+            torch.cuda.empty_cache()
+            break
+
+    torch.cuda.empty_cache()
+    # Marge de sécurité : les vraies réponses IFEval peuvent être bien plus
+    # longues (jusqu'à IFEVAL_GEN_TOKEN_CAP) que ce calibrage, donc leur
+    # KV-cache est plus gros à batch égal.
+    return max(1, int(best * IFEVAL_BATCH_SAFETY_MARGIN))
+
+
+def _parse_ifeval_batch_size(value):
+    """Pour --ifeval-batch-size : 'auto' tel quel, sinon un entier."""
+    return value if value == "auto" else int(value)
+
+
 def _extract_metric(metrics, name):
     """lm-eval préfixe les clés avec le nom du filtre (ex: 'prompt_level_strict_acc,none')."""
     for k, v in metrics.items():
@@ -99,14 +206,10 @@ def _extract_metric(metrics, name):
     return None
 
 
-def run_ifeval(model, tok, limit=None, batch_size=4, apply_chat_template=False):
+def run_ifeval(model, tok, limit=None, batch_size=4):
     """Évalue IFEval (instruction-following) sur le modèle déjà chargé, via
     lm-evaluation-harness. Import différé : lm_eval reste optionnel tant
-    qu'on ne passe pas --ifeval.
-
-    apply_chat_template : les prompts IFEval sont bruts par défaut. À activer
-    pour un modèle entraîné au format chat (cf. finetuning/), sinon il est
-    hors distribution."""
+    qu'on ne passe pas --ifeval."""
     import logging
 
     from lm_eval import simple_evaluate
@@ -114,13 +217,7 @@ def run_ifeval(model, tok, limit=None, batch_size=4, apply_chat_template=False):
 
     logging.getLogger("lm-eval").setLevel(logging.WARNING)
     lm = HFLM(pretrained=model, tokenizer=tok, batch_size=batch_size)
-    out = simple_evaluate(
-        model=lm,
-        tasks=["ifeval"],
-        limit=limit,
-        apply_chat_template=apply_chat_template,
-        bootstrap_iters=0,
-    )
+    out = simple_evaluate(model=lm, tasks=["ifeval"], limit=limit, bootstrap_iters=0)
     return out["results"]["ifeval"]
 
 
@@ -217,7 +314,6 @@ def run_variant(
     ifeval=False,
     ifeval_limit=None,
     ifeval_batch_size=4,
-    ifeval_chat_template=False,
     measure_energy=True,
     energy_gpu_index=0,
     energy_dir=None,
@@ -225,21 +321,29 @@ def run_variant(
     """Charge tokenizer+modèle et évalue UNE variante. Suppose que
     CUDA_VISIBLE_DEVICES est déjà positionné correctement par l'appelant.
 
-    Si measure_energy est activé, le débit, la perplexité (si demandée) et
-    IFEval (si demandé) tournent tous sous EnergyMeasurement, sur
-    `energy_gpu_index` (index PHYSIQUE nvidia-smi du GPU réellement utilisé
-    par ce process — voir le README de energy_measurement/). Comme
+    Si measure_energy est activé, le débit, la perplexité (si demandée),
+    IFEval et ARC-Challenge (si demandés) tournent tous sous
+    EnergyMeasurement, sur `energy_gpu_index` (index PHYSIQUE nvidia-smi du
+    GPU réellement utilisé par ce process — voir le README de
+    energy_measurement/). Comme
     lm-evaluation-harness télécharge/charge son dataset et compile des
     kernels de génération au premier appel, un passage IFEval "à vide" (un
     seul exemple) est fait hors mesure juste avant, uniquement pour chauffer
     ce cache — le run IFEval réel (celui compté dans les résultats) a lieu
-    dans le bloc mesuré."""
-    tok = AutoTokenizer.from_pretrained(model_name)
+    dans le bloc mesuré. Même principe pour ARC-Challenge : dataset chargé et
+    intégralement tokenisé hors mesure, puis une question de chauffe, et seuls
+    les forwards du scoring réel tombent dans le bloc mesuré."""
+    # Pour un checkpoint pré-quantifié (gptq-int8/gptq-int4/awq), load_name
+    # pointe vers son propre repo HF ; model_name reste le nom "logique"
+    # demandé, utilisé pour les métadonnées et les dossiers de résultats afin
+    # que toutes les variantes d'un même modèle restent groupées ensemble.
+    load_name = resolve_model_name(model_name, variant)
+    tok = AutoTokenizer.from_pretrained(load_name)
 
     cfg = build_configs([variant])[variant]
     torch.cuda.empty_cache()
     torch.cuda.reset_peak_memory_stats()
-    model = AutoModelForCausalLM.from_pretrained(model_name, device_map="cuda", **cfg)
+    model = AutoModelForCausalLM.from_pretrained(load_name, device_map="cuda", **cfg)
     model.eval()
 
     # Toute I/O (chargement de données) doit être terminée avant d'entrer
@@ -253,23 +357,52 @@ def run_variant(
         if max_tokens:
             ppl_enc.input_ids = ppl_enc.input_ids[:, :max_tokens]
 
+    # Chauffe hors mesure : le premier appel au modèle compile des kernels et
+    # alloue de la mémoire, ce qui fausserait aussi bien tok/s que la trace
+    # de puissance si on le laissait dans le bloc mesuré.
+    throughput(model, tok, WARMUP_GEN_TOKENS)
+    if ifeval:
+        # Idem pour IFEval : premier appel = téléchargement/chargement du
+        # dataset + compilation. Un seul exemple suffit à chauffer le cache
+        # (le dataset entier est mis en cache local dès ce premier appel).
+        run_ifeval(model, tok, limit=IFEVAL_WARMUP_LIMIT, batch_size=ifeval_batch_size)
+    torch.cuda.synchronize()
+
+    def _run_ifeval_and_record(res):
+        ifeval_metrics = run_ifeval(model, tok, limit=ifeval_limit, batch_size=ifeval_batch_size)
+        res["ifeval"] = ifeval_metrics
+        res["ifeval_score"] = _extract_metric(ifeval_metrics, "prompt_level_strict_acc")
+
     result = {"variant": variant}
-    result.update(
-        measure_loaded_model(
-            model,
-            tok,
-            gen_tokens=gen_tokens,
-            ppl_enc=ppl_enc,
-            ifeval=ifeval,
-            ifeval_limit=ifeval_limit,
-            ifeval_batch_size=ifeval_batch_size,
-            ifeval_chat_template=ifeval_chat_template,
-            measure_energy=measure_energy,
-            energy_gpu_index=energy_gpu_index,
-            energy_dir=energy_dir or energy_output_dir(model_name, variant),
-            energy_metadata={"model": model_name, "variant": variant, "gen_tokens": gen_tokens},
-        )
-    )
+
+    if measure_energy:
+        run_dir = energy_dir or energy_output_dir(model_name, variant)
+        with EnergyMeasurement(
+            gpu_index=energy_gpu_index,
+            output_dir=run_dir,
+            metadata={"model": model_name, "variant": variant, "gen_tokens": gen_tokens},
+        ) as em:
+            result["tok_s"] = throughput(model, tok, gen_tokens)
+            if compute_ppl:
+                result["ppl"] = perplexity(model, ppl_enc)
+            if ifeval:
+                _run_ifeval_and_record(result)
+        result["energy_j"] = em.energy_j
+        result["energy_wh"] = em.energy_j / 3600.0
+        result["mean_power_w"] = em.mean_power_w
+        result["mean_utilization_pct"] = em.mean_utilization_pct
+        result["peak_vram_mib"] = em.peak_vram_mib
+        result["mean_vram_mib"] = em.mean_vram_mib
+        result["energy_run_dir"] = str(em.run_dir)
+    else:
+        result["tok_s"] = throughput(model, tok, gen_tokens)
+        if compute_ppl:
+            result["ppl"] = perplexity(model, ppl_enc)
+        if ifeval:
+            _run_ifeval_and_record(result)
+
+    # Mesuré en dernier : capture le pic mémoire de toute l'évaluation (ppl + tok/s + ifeval).
+    result["vram_gb"] = torch.cuda.max_memory_allocated() / 1e9
 
     del model
     torch.cuda.empty_cache()
@@ -297,7 +430,6 @@ def run_variant_subprocess(
     ifeval=False,
     ifeval_limit=None,
     ifeval_batch_size=4,
-    ifeval_chat_template=False,
     measure_energy=True,
     energy_out=None,
 ):
@@ -322,8 +454,6 @@ def run_variant_subprocess(
         if ifeval_limit is not None:
             cmd += ["--ifeval-limit", str(ifeval_limit)]
         cmd += ["--ifeval-batch-size", str(ifeval_batch_size)]
-        if ifeval_chat_template:
-            cmd.append("--ifeval-chat-template")
     if not measure_energy:
         cmd.append("--no-energy")
     if energy_out:
@@ -347,6 +477,8 @@ def run_variant_subprocess(
         extra += f" energy={result['energy_wh']:.3f}Wh ({result['mean_power_w']:.0f}W moy.)"
     if result.get("ifeval_score") is not None:
         extra += f" ifeval={result['ifeval_score'] * 100:.1f}%"
+    if result.get("arc_score") is not None:
+        extra += f" arc={result['arc_score'] * 100:.1f}%"
     print(
         f"[{variant}] terminé sur GPU {gpu_id} : "
         f"vram={result['vram_gb']:.2f}GB tok/s={result['tok_s']:.1f}{extra}",
@@ -367,7 +499,6 @@ def run_parallel(
     ifeval=False,
     ifeval_limit=None,
     ifeval_batch_size=4,
-    ifeval_chat_template=False,
     measure_energy=True,
     energy_out=None,
 ):
@@ -392,7 +523,6 @@ def run_parallel(
                 ifeval=ifeval,
                 ifeval_limit=ifeval_limit,
                 ifeval_batch_size=ifeval_batch_size,
-                ifeval_chat_template=ifeval_chat_template,
                 measure_energy=measure_energy,
                 energy_out=energy_out,
             )
@@ -403,10 +533,12 @@ def run_parallel(
         return list(ex.map(worker, variants))
 
 
-def print_table(results, ifeval=False):
+def print_table(results, ifeval=False, arc=False):
     header = f"\n{'variant':8} {'ppl':>9} {'VRAM_GB':>9} {'tok/s':>8} {'energy_Wh':>10} {'avg_W':>7}"
     if ifeval:
         header += f" {'ifeval':>8}"
+    if arc:
+        header += f" {'arc_norm':>9}"
     header += "   gpu"
     print(header)
     print("-" * (len(header) + 4))
@@ -428,6 +560,9 @@ def print_table(results, ifeval=False):
             if ifeval:
                 score = r.get("ifeval_score")
                 line += f" {score * 100:7.1f}%" if score is not None else f" {'n/a':>8}"
+            if arc:
+                score = r.get("arc_score")
+                line += f" {score * 100:8.1f}%" if score is not None else f" {'n/a':>9}"
             line += f"   {r.get('gpu', '-')}"
         print(line)
         lines.append(line)
@@ -440,8 +575,12 @@ def main():
     ap.add_argument(
         "--variants",
         nargs="+",
-        default=ALL_VARIANTS,
-        choices=ALL_VARIANTS,
+        default=DEFAULT_VARIANTS,
+        choices=ALL_VARIANTS + list(PREQUANTIZED_SUFFIXES),
+        help="Parmi fp16/bf16/int8/4bit (quantifiés à la volée par bitsandbytes), "
+        "ou gptq-int8/gptq-int4/awq (checkpoints déjà quantifiés hors ligne, "
+        "repo HF = --model + suffixe, ex: '<model>-GPTQ-Int8' — nécessite que "
+        "ce checkpoint existe pour le modèle choisi, et auto-gptq/autoawq installé).",
     )
     ap.add_argument(
         "--max-tokens",
@@ -484,9 +623,33 @@ def main():
     )
     ap.add_argument(
         "--ifeval-batch-size",
+        type=_parse_ifeval_batch_size,
+        default="auto",
+        help="Batch size pour l'évaluation IFEval : un entier fixe, ou 'auto' "
+        "(défaut) pour calibrer automatiquement le plus grand batch qui tient "
+        "dans la VRAM libre, hors mesure, avant de l'utiliser comme batch fixe "
+        "pour le run réel (voir find_max_ifeval_batch_size).",
+    )
+    ap.add_argument(
+        "--arc",
+        action="store_true",
+        help="Évalue aussi ARC-Challenge (raisonnement scientifique, split test, "
+        "1172 questions) par log-vraisemblance — pas de génération.",
+    )
+    ap.add_argument(
+        "--arc-limit",
         type=int,
-        default=4,
-        help="Batch size pour l'évaluation IFEval.",
+        default=None,
+        help="Limite le nombre de questions ARC (défaut: tout le split test, 1172).",
+    )
+    ap.add_argument(
+        "--arc-batch-size",
+        type=int,
+        default=ARC_DEFAULT_BATCH_SIZE,
+        help=f"Nombre de séquences scorées par forward pour ARC (défaut: "
+        f"{ARC_DEFAULT_BATCH_SIZE}). Entier FIXE, jamais 'auto' contrairement à "
+        "--ifeval-batch-size : c'est une variable expérimentale, garde-la "
+        "identique entre variantes pour que les comparaisons tiennent.",
     )
     ap.add_argument(
         "--ifeval-chat-template",
@@ -535,7 +698,6 @@ def main():
             ifeval=args.ifeval,
             ifeval_limit=args.ifeval_limit,
             ifeval_batch_size=args.ifeval_batch_size,
-            ifeval_chat_template=args.ifeval_chat_template,
             measure_energy=args.measure_energy,
             energy_gpu_index=args.energy_gpu_index if args.energy_gpu_index is not None else 0,
             energy_dir=Path(args.energy_out) / args.worker_variant if args.energy_out else None,
@@ -572,7 +734,6 @@ def main():
                 ifeval=args.ifeval,
                 ifeval_limit=args.ifeval_limit,
                 ifeval_batch_size=args.ifeval_batch_size,
-                ifeval_chat_template=args.ifeval_chat_template,
                 measure_energy=args.measure_energy,
                 energy_out=args.energy_out,
             )
@@ -601,7 +762,6 @@ def main():
                 ifeval=args.ifeval,
                 ifeval_limit=args.ifeval_limit,
                 ifeval_batch_size=args.ifeval_batch_size,
-                ifeval_chat_template=args.ifeval_chat_template,
                 measure_energy=args.measure_energy,
                 energy_gpu_index=seq_energy_gpu_index,
                 energy_dir=Path(args.energy_out) / v if args.energy_out else None,
@@ -615,7 +775,7 @@ def main():
     order = {v: i for i, v in enumerate(args.variants)}
     results.sort(key=lambda r: order.get(r["variant"], 999))
 
-    table_lines = print_table(results, ifeval=args.ifeval)
+    table_lines = print_table(results, ifeval=args.ifeval, arc=args.arc)
     print(f"\ntemps total: {elapsed:.1f}s")
 
     out_path = (
@@ -636,7 +796,6 @@ def main():
                 "compute_ppl": args.compute_ppl,
                 "ifeval": args.ifeval,
                 "ifeval_limit": args.ifeval_limit,
-                "ifeval_chat_template": args.ifeval_chat_template,
                 "measure_energy": args.measure_energy,
                 "elapsed_s": elapsed,
                 "results": results,

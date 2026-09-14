@@ -3,4 +3,5 @@ CLAUDE.md
 logs/
 results/
 __pycache__/
+*.pyc
 finetuning/out/
