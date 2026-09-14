@@ -5,6 +5,8 @@ datasets>=2.19,<4
 huggingface_hub<1.0
 accelerate>=0.33
 bitsandbytes>=0.43
+auto-gptq>=0.7  # variantes gptq-int8/gptq-int4 (checkpoints pré-quantifiés)
+autoawq>=0.2    # variante awq (checkpoint pré-quantifié)
 lm-eval[ifeval]>=0.4.4
 numpy
 pandas

@@ -18,6 +18,11 @@ Usage:
     python benchmark.py --ifeval --ifeval-limit 40     # + score IFEval (sous-échantillonné)
     python benchmark.py --arc --arc-batch-size 16      # + score ARC-Challenge (log-vraisemblance)
     python benchmark.py --ppl                          # + perplexité WikiText-2
+    python benchmark.py --variants gptq-int8 gptq-int4 awq --ifeval
+        # checkpoints pré-quantifiés hors ligne (repo HF = --model + suffixe,
+        # ex: "<model>-GPTQ-Int8") au lieu d'une quantification bitsandbytes
+        # à la volée — nécessite que ce checkpoint existe pour --model, et
+        # auto-gptq/autoawq installés.
 """
 import argparse
 import json
@@ -50,6 +55,24 @@ sys.path.insert(0, str(Path(__file__).parent / "energy_measurement"))
 from energy_measurement import EnergyMeasurement  # noqa: E402
 
 ALL_VARIANTS = ["fp16", "bf16", "int8", "4bit"]
+# Checkpoints déjà quantifiés hors ligne (calibrés une fois, pas à la volée au
+# chargement) — contrairement à int8/4bit ci-dessus qui sont quantifiés par
+# bitsandbytes au moment du from_pretrained. Suffixe ajouté au nom du modèle
+# demandé (--model), suivant la convention Qwen (ex: "Qwen/Qwen2.5-1.5B-
+# Instruct" -> "Qwen/Qwen2.5-1.5B-Instruct-GPTQ-Int8"). Nécessite le
+# checkpoint correspondant publié pour le modèle choisi, et le backend GPTQ
+# (auto-gptq) ou AWQ (autoawq) installé — voir requirements.txt.
+PREQUANTIZED_SUFFIXES = {
+    "gptq-int8": "-GPTQ-Int8",
+    "gptq-int4": "-GPTQ-Int4",
+    "awq": "-AWQ",
+}
+# Défaut : remplace les variantes quantifiées à la volée par bitsandbytes
+# (int8, 4bit) par leurs équivalents pré-quantifiés hors ligne. gptq-int4 ET
+# awq sont gardés ensemble (même largeur 4 bits, deux algorithmes différents
+# à comparer). bitsandbytes int8/4bit restent utilisables via --variants
+# explicite, pour comparer quantification à la volée vs hors ligne.
+DEFAULT_VARIANTS = ["fp16", "bf16", "gptq-int8", "gptq-int4", "awq"]
 FORBIDDEN_GPUS = {"3"}  # GPU 3 hors limites sur cette machine, ne jamais l'utiliser.
 WARMUP_GEN_TOKENS = 8  # chauffe hors mesure, avant d'entrer dans EnergyMeasurement.
 IFEVAL_WARMUP_LIMIT = 1  # idem, pour chauffer le cache dataset IFEval + compiler les kernels.
@@ -101,7 +124,19 @@ def build_configs(selected):
             )
         ),
     }
+    # Checkpoints pré-quantifiés : la quantification est déjà sur disque (dans
+    # le config.json du repo), pas de quantization_config à fournir ici.
+    for variant in PREQUANTIZED_SUFFIXES:
+        all_cfg[variant] = dict(dtype="auto")
     return {k: all_cfg[k] for k in selected}
+
+
+def resolve_model_name(model_name, variant):
+    """Nom du repo HF à charger pour cette variante : le modèle demandé tel
+    quel, sauf pour les checkpoints pré-quantifiés qui vivent dans un repo à
+    part (voir PREQUANTIZED_SUFFIXES)."""
+    suffix = PREQUANTIZED_SUFFIXES.get(variant)
+    return f"{model_name}{suffix}" if suffix else model_name
 
 
 @torch.no_grad()
@@ -425,12 +460,17 @@ def run_variant(
     dans le bloc mesuré. Même principe pour ARC-Challenge : dataset chargé et
     intégralement tokenisé hors mesure, puis une question de chauffe, et seuls
     les forwards du scoring réel tombent dans le bloc mesuré."""
-    tok = AutoTokenizer.from_pretrained(model_name)
+    # Pour un checkpoint pré-quantifié (gptq-int8/gptq-int4/awq), load_name
+    # pointe vers son propre repo HF ; model_name reste le nom "logique"
+    # demandé, utilisé pour les métadonnées et les dossiers de résultats afin
+    # que toutes les variantes d'un même modèle restent groupées ensemble.
+    load_name = resolve_model_name(model_name, variant)
+    tok = AutoTokenizer.from_pretrained(load_name)
 
     cfg = build_configs([variant])[variant]
     torch.cuda.empty_cache()
     torch.cuda.reset_peak_memory_stats()
-    model = AutoModelForCausalLM.from_pretrained(model_name, device_map="cuda", **cfg)
+    model = AutoModelForCausalLM.from_pretrained(load_name, device_map="cuda", **cfg)
     model.eval()
 
     # Toute I/O (chargement de données) doit être terminée avant d'entrer
@@ -746,8 +786,12 @@ def main():
     ap.add_argument(
         "--variants",
         nargs="+",
-        default=ALL_VARIANTS,
-        choices=ALL_VARIANTS,
+        default=DEFAULT_VARIANTS,
+        choices=ALL_VARIANTS + list(PREQUANTIZED_SUFFIXES),
+        help="Parmi fp16/bf16/int8/4bit (quantifiés à la volée par bitsandbytes), "
+        "ou gptq-int8/gptq-int4/awq (checkpoints déjà quantifiés hors ligne, "
+        "repo HF = --model + suffixe, ex: '<model>-GPTQ-Int8' — nécessite que "
+        "ce checkpoint existe pour le modèle choisi, et auto-gptq/autoawq installé).",
     )
     ap.add_argument(
         "--max-tokens",
