@@ -68,12 +68,12 @@ PREQUANTIZED_SUFFIXES = {
     "gptq-int4": "-GPTQ-Int4",
     "awq": "-AWQ",
 }
-# Défaut : remplace les variantes quantifiées à la volée par bitsandbytes
-# (int8, 4bit) par leurs équivalents pré-quantifiés hors ligne. gptq-int4 ET
-# awq sont gardés ensemble (même largeur 4 bits, deux algorithmes différents
-# à comparer). bitsandbytes int8/4bit restent utilisables via --variants
-# explicite, pour comparer quantification à la volée vs hors ligne.
-DEFAULT_VARIANTS = ["fp16", "bf16", "gptq-int8", "gptq-int4", "awq"]
+# Défaut : les 4 variantes quantifiées à la volée par bitsandbytes, qui ne
+# demandent aucune dépendance supplémentaire. gptq-int8/gptq-int4/awq restent
+# utilisables via --variants explicite, mais demandent des versions de
+# transformers incompatibles entre elles ET avec celle-ci — chacune dans son
+# propre venv, voir requirements-awq.txt et requirements-gptq.txt.
+DEFAULT_VARIANTS = ALL_VARIANTS
 FORBIDDEN_GPUS = {"3"}  # GPU 3 hors limites sur cette machine, ne jamais l'utiliser.
 WARMUP_GEN_TOKENS = 8  # chauffe hors mesure, avant d'entrer dans EnergyMeasurement.
 IFEVAL_WARMUP_LIMIT = 1  # idem, pour chauffer le cache dataset IFEval + compiler les kernels.

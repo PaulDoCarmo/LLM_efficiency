@@ -1,13 +1,14 @@
 ﻿--extra-index-url https://download.pytorch.org/whl/cu128
 torch>=2.1
-transformers>=4.44,<5
+transformers>=4.44
 datasets>=2.19,<4
 huggingface_hub<1.0
 accelerate>=0.33
 bitsandbytes>=0.43
-gptqmodel>=7.0,<8  # variantes gptq-int8/gptq-int4 — successeur maintenu d'auto-gptq. Plancher 7.0 : les
-                    # versions <7.0 (ex: 6.0.3) ont un setup.py cassé (import 'pcre' fantôme).
-autoawq>=0.2    # variante awq (checkpoint pré-quantifié)
+# gptq-int8/gptq-int4/awq (checkpoints pré-quantifiés) demandent des versions
+# de transformers incompatibles entre elles et avec celle-ci (gptqmodel veut
+# transformers>=5.4, autoawq veut transformers<=4.47.1) — pas installées ici.
+# awq est utilisable via un venv séparé, voir requirements-awq.txt.
 lm-eval[ifeval]>=0.4.4
 numpy
 pandas

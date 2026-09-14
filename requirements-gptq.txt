@@ -1,0 +1,16 @@
+--extra-index-url https://download.pytorch.org/whl/cu128
+torch>=2.1
+transformers>=5.4
+datasets>=2.19,<4
+huggingface_hub<1.0
+accelerate>=0.33
+# Plafond <7.3.5 : les versions 7.3.5+ demandent transformers>=5.14 au lieu de
+# >=5.4, inutilement plus strict pour ce qu'on en fait ici.
+gptqmodel>=7.0,<7.3.5
+# lm-eval (--ifeval) n'a pas été testé avec transformers>=5.4 — ARC (--arc)
+# n'en dépend pas du tout et est le choix sûr ici. Essayer --ifeval est
+# possible mais peut échouer si lm-eval-harness ne supporte pas encore
+# transformers 5.x.
+lm-eval[ifeval]>=0.4.4
+numpy
+pandas

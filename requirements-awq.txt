@@ -1,0 +1,10 @@
+--extra-index-url https://download.pytorch.org/whl/cu128
+torch>=2.1
+transformers>=4.45,<=4.47.1
+datasets>=2.19,<4
+huggingface_hub<1.0
+accelerate>=0.33
+autoawq>=0.2
+lm-eval[ifeval]>=0.4.4
+numpy
+pandas
