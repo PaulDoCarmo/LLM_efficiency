@@ -4,3 +4,4 @@ logs/
 results/
 __pycache__/
 finetuning/out/
+pruning/checkpoints/

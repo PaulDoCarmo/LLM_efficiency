@@ -1,3 +1,4 @@
 nvidia-ml-py
 pillow
 numpy
+torch-pruning
