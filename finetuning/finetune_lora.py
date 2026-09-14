@@ -26,6 +26,36 @@ import os
 # Aligne la numérotation CUDA sur celle de nvidia-smi, comme benchmark.py.
 os.environ.setdefault("CUDA_DEVICE_ORDER", "PCI_BUS_ID")
 
+FORBIDDEN_GPUS = {"3"}  # GPU 3 hors limites sur cette machine (cf. benchmark.py).
+
+
+def _pin_single_gpu():
+    """N'expose qu'un seul GPU, avant tout import de torch.
+
+    Le Trainer de transformers enveloppe automatiquement le modèle dans
+    `nn.DataParallel` dès qu'il voit plusieurs GPUs. Or les poids
+    `Params4bit` de bitsandbytes ne survivent pas à la réplication DataParallel
+    (leur état de quantification n'est pas répliqué) : on obtient un
+    `CUDA error: an illegal memory access was encountered` au premier forward.
+    QLoRA veut un seul GPU — ou du vrai DDP via accelerate, pas du DataParallel.
+    """
+    visible = [
+        g.strip()
+        for g in os.environ.get("CUDA_VISIBLE_DEVICES", "").split(",")
+        if g.strip()
+    ]
+    allowed = [g for g in visible if g not in FORBIDDEN_GPUS]
+    chosen = allowed[0] if allowed else "0"
+    if len(visible) > 1 or not visible:
+        print(
+            f"GPU epinglé sur {chosen} "
+            f"(QLoRA + DataParallel = incompatible ; CUDA_VISIBLE_DEVICES=N pour changer)."
+        )
+    os.environ["CUDA_VISIBLE_DEVICES"] = chosen
+
+
+_pin_single_gpu()
+
 import torch
 from datasets import load_dataset
 from peft import LoraConfig, get_peft_model, prepare_model_for_kbit_training
