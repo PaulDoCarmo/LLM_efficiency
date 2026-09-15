@@ -15,6 +15,7 @@ from benchmark import (  # noqa: E402
     ARC_TEST_SIZE,
     _arc_chat_context,
     _arc_context,
+    _arc_loglikelihoods,
     arc_gold_index,
     load_arc_challenge,
     prepare_arc_requests,
@@ -151,6 +152,76 @@ def test_chat_context_adds_no_leading_space():
     # Le prompt ChatML est plus long, donc chaque séquence aussi.
     for (pc, pk), (cc, ck) in zip(plain["encoded"], chat["encoded"]):
         assert len(cc) > len(pc)
+
+
+class _FakeModel:
+    """Modèle factice : renvoie des logits déterministes fonction du token
+    d'entrée et de la position, donc reproductibles sans GPU. Suffit à
+    vérifier que le tri ne change pas l'appariement séquence/résultat."""
+
+    class config:
+        max_position_embeddings = 2048
+
+    device = "cpu"
+
+    def __call__(self, input_ids, attention_mask=None):
+        import torch
+
+        b, t = input_ids.shape
+        vocab = 64
+        pos = torch.arange(t, dtype=torch.float32).view(1, t, 1)
+        tokv = input_ids.float().unsqueeze(-1)
+        vals = torch.arange(vocab, dtype=torch.float32).view(1, 1, vocab)
+        logits = torch.sin(tokv * 0.7 + pos * 0.3 + vals * 0.11)
+        return type("Out", (), {"logits": logits})()
+
+
+class _FakeTok:
+    pad_token_id = 0
+    eos_token_id = 0
+
+
+def test_sort_by_length_leaves_scores_unchanged():
+    """Le tri ne change QUE le regroupement en batches. Chaque séquence doit
+    retrouver exactement sa log-vraisemblance, à sa place d'origine."""
+    import random
+
+    rng = random.Random(0)
+    # Longueurs volontairement très inégales : c'est là que le tri réordonne
+    # le plus, donc là qu'une erreur d'indice se verrait.
+    encoded = []
+    for _ in range(37):
+        ctx = [rng.randrange(1, 60) for _ in range(rng.randrange(3, 25))]
+        cont = [rng.randrange(1, 60) for _ in range(rng.randrange(1, 5))]
+        encoded.append((ctx, cont))
+
+    model, tok = _FakeModel(), _FakeTok()
+    ref, fwd_ref = _arc_loglikelihoods(model, tok, encoded, 8, 2048, sort_by_length=False)
+    got, fwd_got = _arc_loglikelihoods(model, tok, encoded, 8, 2048, sort_by_length=True)
+
+    assert fwd_ref == fwd_got, "le tri ne doit pas changer le nombre de forwards"
+    assert len(got) == len(encoded) and None not in got
+    for i, (a, b) in enumerate(zip(ref, got)):
+        assert abs(a - b) < 1e-4, f"séquence {i} : {a} != {b}"
+
+
+def test_sort_by_length_reduces_padding():
+    """Vérifie le gain réel du tri sur les séquences d'ARC, pas sur un jouet."""
+    from transformers import AutoTokenizer
+
+    tok = AutoTokenizer.from_pretrained("Qwen/Qwen2.5-1.5B-Instruct")
+    req = prepare_arc_requests(tok, load_arc_challenge())
+    lengths = [len(c) + len(k) for c, k in req["encoded"]]
+    useful = sum(lengths)
+
+    def padded(seq, bs):
+        return sum(bs * max(seq[i : i + bs]) for i in range(0, len(seq), bs))
+
+    bs = 256
+    plain = padded(lengths, bs) / useful
+    sortd = padded(sorted(lengths, reverse=True), bs) / useful
+    assert plain > 2.5, f"gaspillage sans tri attendu > 2.5x, mesuré {plain:.2f}x"
+    assert sortd < 1.3, f"gaspillage avec tri attendu < 1.3x, mesuré {sortd:.2f}x"
 
 
 if __name__ == "__main__":

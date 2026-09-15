@@ -1,5 +1,7 @@
 CLAUDE.md
 .venv/
+.venv-awq/
+.venv-gptq/
 logs/
 results/
 __pycache__/

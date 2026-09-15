@@ -108,6 +108,25 @@ def _load_trace(csv_path: Path) -> pd.DataFrame:
             f"En-tête brut : {list(df.columns)}. Le nommage nvidia-smi a probablement changé."
         )
     df["timestamp"] = pd.to_datetime(df["timestamp"].str.strip(), format=TIMESTAMP_FORMAT)
+
+    # nvidia-smi émet parfois "[N/A]" quand une lecture de capteur échoue. Une
+    # seule valeur de ce type suffit à faire passer la colonne en dtype object,
+    # et l'intégration numpy échoue alors avec un TypeError obscur. On force
+    # donc le type et on écarte les échantillons inexploitables : l'intégrale
+    # se fait sur les timestamps réels, sauter un point allonge simplement un
+    # trapèze, ce qui reste correct.
+    numeric = ["power_w", "clock_sm_mhz", "temperature_c", "utilization_pct", "vram_used_mib"]
+    for col in numeric:
+        df[col] = pd.to_numeric(df[col], errors="coerce")
+    bad = int(df["power_w"].isna().sum())
+    if bad:
+        total = len(df)
+        print(
+            f"ATTENTION : {bad}/{total} échantillons de puissance illisibles "
+            f"([N/A] nvidia-smi), écartés de l'intégration."
+        )
+        df = df[df["power_w"].notna()]
+
     return df.sort_values("timestamp").reset_index(drop=True)
 
 

@@ -372,22 +372,38 @@ def _arc_head(requests, n_docs):
 
 
 @torch.no_grad()
-def _arc_loglikelihoods(model, tok, encoded, batch_size, max_length):
+def _arc_loglikelihoods(model, tok, encoded, batch_size, max_length, sort_by_length=False):
     """Log-vraisemblance totale de chaque continuation sachant son contexte.
 
     Un forward par batch, de taille FIXE (jamais adaptée à la VRAM : c'est une
-    variable expérimentale, voir --arc-batch-size). Les séquences sont
-    traitées dans l'ordre du dataset, sans tri par longueur, pour que le
-    nombre et la forme des forwards soient identiques d'une variante à
-    l'autre.
+    variable expérimentale, voir --arc-batch-size).
 
-    Renvoie (log-vraisemblances, nombre de forwards effectués)."""
+    Ordre de traitement, selon sort_by_length :
+    - False (défaut) : ordre du dataset. Le nombre ET la forme des forwards
+      sont alors identiques d'une variante à l'autre, mais chaque batch est
+      complété à la longueur de son élément le plus long, ce qui gaspille
+      jusqu'à 2,9× le calcul utile à batch 256 sur ARC.
+    - True : séquences regroupées par longueur décroissante. Le padding tombe
+      à ~1,2× à batch 256. Les batches dépendent alors du contenu du dataset,
+      et le plus gros passe en premier, donc un dépassement mémoire survient
+      immédiatement plutôt qu'à mi-parcours.
+
+    Le tri ne change PAS ce qui est calculé : chaque séquence reçoit le même
+    contexte et la même continuation, seul leur regroupement change. Les
+    scores doivent donc être identiques au bruit fp16 près.
+
+    Renvoie (log-vraisemblances, dans l'ordre d'entrée, et nombre de forwards)."""
     pad_id = tok.pad_token_id if tok.pad_token_id is not None else (tok.eos_token_id or 0)
-    lls = []
+    order = list(range(len(encoded)))
+    if sort_by_length:
+        order.sort(key=lambda i: len(encoded[i][0]) + len(encoded[i][1]), reverse=True)
+    # Rempli par indice d'origine : le tri ne doit pas transparaître en sortie.
+    lls = [None] * len(encoded)
     forward_passes = 0
 
-    for start in range(0, len(encoded), batch_size):
-        chunk = encoded[start : start + batch_size]
+    for start in range(0, len(order), batch_size):
+        idx = order[start : start + batch_size]
+        chunk = [encoded[i] for i in idx]
         # Le dernier token n'a pas de cible : on donne au modèle ctx+cont
         # amputé de son dernier token et on lit la distribution prédite pour
         # chaque token de la continuation.
@@ -415,7 +431,7 @@ def _arc_loglikelihoods(model, tok, encoded, batch_size, max_length):
             # batch coûterait un tenseur float32 de taille batch x width x vocab.
             logprobs = torch.log_softmax(logits[i, end - len(cont) : end, :].float(), dim=-1)
             targets = torch.tensor(cont, dtype=torch.long, device=logprobs.device)
-            lls.append(logprobs.gather(-1, targets.unsqueeze(-1)).sum().item())
+            lls[idx[i]] = logprobs.gather(-1, targets.unsqueeze(-1)).sum().item()
 
     return lls, forward_passes
 
@@ -425,7 +441,7 @@ def _binomial_stderr(p, n):
     return math.sqrt(p * (1.0 - p) / n) if n > 0 else None
 
 
-def run_arc(model, tok, requests, batch_size=ARC_DEFAULT_BATCH_SIZE):
+def run_arc(model, tok, requests, batch_size=ARC_DEFAULT_BATCH_SIZE, sort_by_length=False):
     """Évalue ARC-Challenge sur le modèle déjà chargé, par log-vraisemblance.
 
     `requests` vient de prepare_arc_requests : tout est déjà tokenisé, aucune
@@ -444,7 +460,7 @@ def run_arc(model, tok, requests, batch_size=ARC_DEFAULT_BATCH_SIZE):
         getattr(model.config, "max_position_embeddings", None) or ARC_FALLBACK_MAX_LENGTH
     )
     lls, forward_passes = _arc_loglikelihoods(
-        model, tok, requests["encoded"], batch_size, max_length
+        model, tok, requests["encoded"], batch_size, max_length, sort_by_length=sort_by_length
     )
 
     byte_lens, golds = requests["byte_lens"], requests["golds"]
@@ -487,6 +503,7 @@ def run_variant(
     arc_limit=None,
     arc_batch_size=ARC_DEFAULT_BATCH_SIZE,
     arc_chat_template=False,
+    arc_sort_by_length=False,
     measure_energy=True,
     energy_gpu_index=0,
     energy_dir=None,
@@ -553,7 +570,8 @@ def run_variant(
     if arc:
         # Idem : le premier forward compile des kernels. Une seule question
         # (ARC_WARMUP_LIMIT) suffit, le dataset est déjà tokenisé au-dessus.
-        run_arc(model, tok, _arc_head(arc_requests, ARC_WARMUP_LIMIT), batch_size=arc_batch_size)
+        run_arc(model, tok, _arc_head(arc_requests, ARC_WARMUP_LIMIT),
+                batch_size=arc_batch_size, sort_by_length=arc_sort_by_length)
     torch.cuda.synchronize()
 
     def _run_ifeval_and_record(res):
@@ -581,7 +599,8 @@ def run_variant(
 
     def _run_arc_and_record(res):
         t0 = time.time()
-        arc_metrics = run_arc(model, tok, arc_requests, batch_size=arc_batch_size)
+        arc_metrics = run_arc(model, tok, arc_requests, batch_size=arc_batch_size,
+                              sort_by_length=arc_sort_by_length)
         arc_elapsed_s = time.time() - t0
         res["arc"] = arc_metrics
         # Métrique principale d'ARC-Challenge : acc_norm (log-vraisemblance
@@ -596,6 +615,10 @@ def run_variant(
         # Format du prompt : complétion ou ChatML. Change les scores autant que
         # la quantization, donc jamais comparer deux runs qui diffèrent dessus.
         res["arc_chat_template"] = arc_chat_template
+        # Stratégie de regroupement des séquences. Change le coût, jamais les
+        # scores : deux runs qui ne diffèrent que là-dessus doivent donner la
+        # même justesse.
+        res["arc_sort_by_length"] = arc_sort_by_length
         # Unité de travail GPU d'ARC (le scoring ne génère rien) : sert à
         # normaliser l'énergie, comme les tokens générés pour IFEval.
         res["arc_forward_passes"] = arc_metrics["forward_passes"]
@@ -682,6 +705,7 @@ def run_variant_subprocess(
     arc_limit=None,
     arc_batch_size=ARC_DEFAULT_BATCH_SIZE,
     arc_chat_template=False,
+    arc_sort_by_length=False,
     measure_energy=True,
     energy_out=None,
 ):
@@ -713,6 +737,8 @@ def run_variant_subprocess(
         cmd += ["--arc-batch-size", str(arc_batch_size)]
         if arc_chat_template:
             cmd.append("--arc-chat-template")
+        if arc_sort_by_length:
+            cmd.append("--arc-sort-by-length")
     if not measure_energy:
         cmd.append("--no-energy")
     if energy_out:
@@ -762,6 +788,7 @@ def run_parallel(
     arc_limit=None,
     arc_batch_size=ARC_DEFAULT_BATCH_SIZE,
     arc_chat_template=False,
+    arc_sort_by_length=False,
     measure_energy=True,
     energy_out=None,
 ):
@@ -790,6 +817,7 @@ def run_parallel(
                 arc_limit=arc_limit,
                 arc_batch_size=arc_batch_size,
                 arc_chat_template=arc_chat_template,
+                arc_sort_by_length=arc_sort_by_length,
                 measure_energy=measure_energy,
                 energy_out=energy_out,
             )
@@ -928,6 +956,15 @@ def main():
         "et les scores ne sont PAS comparables à ceux d'un run en complétion.",
     )
     ap.add_argument(
+        "--arc-sort-by-length",
+        action="store_true",
+        help="Regroupe les séquences ARC par longueur décroissante au lieu de "
+        "suivre l'ordre du dataset. Chaque batch n'est alors complété que "
+        "jusqu'à des séquences de taille voisine : le padding tombe de ~2,9× à "
+        "~1,2× le calcul utile à batch 256. Les scores sont inchangés, seul le "
+        "coût l'est — mais les batches dépendent du contenu du dataset.",
+    )
+    ap.add_argument(
         "--no-energy",
         dest="measure_energy",
         action="store_false",
@@ -971,6 +1008,7 @@ def main():
             arc_limit=args.arc_limit,
             arc_batch_size=args.arc_batch_size,
             arc_chat_template=args.arc_chat_template,
+            arc_sort_by_length=args.arc_sort_by_length,
             measure_energy=args.measure_energy,
             energy_gpu_index=args.energy_gpu_index if args.energy_gpu_index is not None else 0,
             energy_dir=Path(args.energy_out) / args.worker_variant if args.energy_out else None,
@@ -1011,6 +1049,7 @@ def main():
                 arc_limit=args.arc_limit,
                 arc_batch_size=args.arc_batch_size,
                 arc_chat_template=args.arc_chat_template,
+                arc_sort_by_length=args.arc_sort_by_length,
                 measure_energy=args.measure_energy,
                 energy_out=args.energy_out,
             )
@@ -1043,6 +1082,7 @@ def main():
                 arc_limit=args.arc_limit,
                 arc_batch_size=args.arc_batch_size,
                 arc_chat_template=args.arc_chat_template,
+                arc_sort_by_length=args.arc_sort_by_length,
                 measure_energy=args.measure_energy,
                 energy_gpu_index=seq_energy_gpu_index,
                 energy_dir=Path(args.energy_out) / v if args.energy_out else None,
@@ -1081,6 +1121,7 @@ def main():
                 "arc_limit": args.arc_limit,
                 "arc_batch_size": args.arc_batch_size,
                 "arc_chat_template": args.arc_chat_template,
+                "arc_sort_by_length": args.arc_sort_by_length,
                 "measure_energy": args.measure_energy,
                 "elapsed_s": elapsed,
                 "results": results,
