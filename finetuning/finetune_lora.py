@@ -213,6 +213,33 @@ def load_base_model(model_name):
     return AutoModelForCausalLM.from_pretrained(model_name, **kwargs)
 
 
+def _training_arguments(**kwargs):
+    """Construit les TrainingArguments en ne passant que les champs supportés.
+
+    transformers 5.x a supprimé ou renommé plusieurs champs présents en 4.x
+    (`warmup_ratio`, entre autres). Plutôt que de planter sur un TypeError au
+    premier champ inconnu, on inspecte la signature réellement installée et on
+    signale ce qui est écarté — les valeurs concernées retombent alors sur les
+    défauts de la bibliothèque.
+    """
+    import dataclasses
+    import inspect
+
+    try:
+        supported = {f.name for f in dataclasses.fields(TrainingArguments)}
+    except TypeError:  # plus un dataclass : on se rabat sur la signature
+        supported = set(inspect.signature(TrainingArguments.__init__).parameters) - {"self"}
+
+    kept = {k: v for k, v in kwargs.items() if k in supported}
+    dropped = sorted(set(kwargs) - set(kept))
+    if dropped:
+        print(
+            f"TrainingArguments : {len(dropped)} paramètre(s) ignoré(s), absent(s) de "
+            f"cette version de transformers -> {dropped}"
+        )
+    return TrainingArguments(**kept)
+
+
 def build_model(model_name, lora_r, lora_alpha, lora_dropout, grad_checkpointing):
     model = load_base_model(model_name)
     model.config.use_cache = False  # incompatible avec le gradient checkpointing
@@ -294,7 +321,7 @@ def main():
         args.grad_checkpointing,
     )
 
-    training_args = TrainingArguments(
+    training_args = _training_arguments(
         output_dir=args.output_dir,
         num_train_epochs=args.epochs,
         per_device_train_batch_size=args.batch_size,
