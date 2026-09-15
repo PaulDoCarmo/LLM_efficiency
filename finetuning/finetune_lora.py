@@ -1,11 +1,17 @@
 #!/usr/bin/env python
-"""LoRA sur Qwen2.5-1.5B quantifié en 4bit (QLoRA), pour le suivi d'instructions.
+"""LoRA sur une base quantifiée et gelée, pour le suivi d'instructions.
+
+Le format de la base est détecté automatiquement :
+  - checkpoint déjà quantifié (GPTQ-Int8, GPTQ-Int4, AWQ) : chargé tel quel,
+    aucune requantification (voir load_base_model) ;
+  - checkpoint en pleine précision : quantifié à la volée en 4 bits NF4,
+    recette QLoRA classique.
 
 Dataset : allenai/tulu-3-sft-personas-instruction-following (sous-ensemble
 "instruction following" du mélange SFT de Tulu 3), au format `messages`.
 
 Recette :
-  - base gelée en 4bit NF4 + double quantification, calcul en bf16 (A100)
+  - base gelée (GPTQ tel quel, ou NF4 + double quantification si non quantifiée)
   - LoRA r=16 sur les projections attention + MLP
   - perte calculée UNIQUEMENT sur la réponse de l'assistant (le prompt est
     masqué à -100), ce qui est ce qu'on veut pour de l'instruction tuning
@@ -19,6 +25,9 @@ Usage:
     python finetuning/finetune_lora.py
     python finetuning/finetune_lora.py --max-samples 2000 --epochs 1   # essai rapide
     CUDA_VISIBLE_DEVICES=0 python finetuning/finetune_lora.py
+    python finetuning/finetune_lora.py \
+        --model Qwen/Qwen2.5-1.5B-Instruct-GPTQ-Int8 \
+        --output-dir finetuning/out/qwen2.5-1.5b-instruct-gptq-int8-lora
 """
 import argparse
 import os
@@ -34,10 +43,10 @@ def _pin_single_gpu():
 
     Le Trainer de transformers enveloppe automatiquement le modèle dans
     `nn.DataParallel` dès qu'il voit plusieurs GPUs. Or les poids
-    `Params4bit` de bitsandbytes ne survivent pas à la réplication DataParallel
+    quantifiés (bitsandbytes comme GPTQ) ne survivent pas à la réplication DataParallel
     (leur état de quantification n'est pas répliqué) : on obtient un
     `CUDA error: an illegal memory access was encountered` au premier forward.
-    QLoRA veut un seul GPU — ou du vrai DDP via accelerate, pas du DataParallel.
+    On veut un seul GPU — ou du vrai DDP via accelerate, pas du DataParallel.
     """
     visible = [
         g.strip()
@@ -60,6 +69,7 @@ import torch
 from datasets import load_dataset
 from peft import LoraConfig, get_peft_model, prepare_model_for_kbit_training
 from transformers import (
+    AutoConfig,
     AutoModelForCausalLM,
     AutoTokenizer,
     BitsAndBytesConfig,
@@ -146,19 +156,65 @@ def build_dataset(tok, dataset_name, split, max_seq_len, max_samples, seed, num_
     return keep
 
 
+def _quantization_method(model_name):
+    """Méthode de quantification déjà inscrite dans le repo, ou None.
+
+    Un checkpoint pré-quantifié (GPTQ, AWQ) porte sa propre `quantization_config`
+    dans son config.json. Il ne faut alors SURTOUT PAS lui passer un
+    BitsAndBytesConfig : la quantification est déjà faite, et les deux
+    configurations entreraient en conflit.
+    """
+    cfg = AutoConfig.from_pretrained(model_name)
+    quant = getattr(cfg, "quantization_config", None)
+    if quant is None:
+        return None, None
+    as_dict = quant if isinstance(quant, dict) else quant.to_dict()
+    return as_dict.get("quant_method"), as_dict
+
+
+def load_base_model(model_name):
+    """Charge la base gelée, en s'adaptant au format du checkpoint."""
+    method, quant = _quantization_method(model_name)
+
+    if method is None:
+        # Checkpoint en pleine précision : on quantifie à la volée, recette QLoRA.
+        print("base : pleine précision -> quantification à la volée en NF4 (QLoRA)")
+        return AutoModelForCausalLM.from_pretrained(
+            model_name,
+            quantization_config=BitsAndBytesConfig(
+                load_in_4bit=True,
+                bnb_4bit_quant_type="nf4",  # NF4 = recette QLoRA (≠ fp4, défaut de bnb)
+                bnb_4bit_compute_dtype=torch.bfloat16,
+                bnb_4bit_use_double_quant=True,
+            ),
+            dtype=torch.bfloat16,
+            device_map={"": 0},  # un seul GPU : pas de sharding
+        )
+
+    bits = quant.get("bits", "?")
+    print(f"base : checkpoint déjà quantifié ({method}, {bits} bits) -> aucune requantification")
+
+    if method == "awq":
+        print(
+            "ATTENTION : l'entraînement sur un checkpoint AWQ est mal supporté "
+            "(kernels sans passe arrière). Si ça casse, passe par GPTQ."
+        )
+
+    kwargs = dict(dtype="auto", device_map={"": 0})
+    if method == "gptq":
+        # Les kernels exllama sont optimisés pour l'inférence et n'implémentent
+        # pas la passe arrière : il faut les désactiver pour entraîner un LoRA
+        # par-dessus. On réinjecte les bits lus dans le repo pour ne pas
+        # écraser la configuration d'origine.
+        from transformers import GPTQConfig
+
+        kwargs["quantization_config"] = GPTQConfig(bits=quant.get("bits", 8), use_exllama=False)
+
+    return AutoModelForCausalLM.from_pretrained(model_name, **kwargs)
+
+
 def build_model(model_name, lora_r, lora_alpha, lora_dropout, grad_checkpointing):
-    quant_cfg = BitsAndBytesConfig(
-        load_in_4bit=True,
-        bnb_4bit_quant_type="nf4",  # NF4 = recette QLoRA (≠ fp4, défaut de bnb)
-        bnb_4bit_compute_dtype=torch.bfloat16,
-        bnb_4bit_use_double_quant=True,
-    )
-    model = AutoModelForCausalLM.from_pretrained(
-        model_name,
-        quantization_config=quant_cfg,
-        dtype=torch.bfloat16,
-        device_map={"": 0},  # un seul GPU : pas de sharding
-    )
+    model = load_base_model(model_name)
     model.config.use_cache = False  # incompatible avec le gradient checkpointing
     model = prepare_model_for_kbit_training(
         model, use_gradient_checkpointing=grad_checkpointing
