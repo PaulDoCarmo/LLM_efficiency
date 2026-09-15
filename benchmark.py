@@ -206,10 +206,14 @@ def _extract_metric(metrics, name):
     return None
 
 
-def run_ifeval(model, tok, limit=None, batch_size=4):
+def run_ifeval(model, tok, limit=None, batch_size=4, apply_chat_template=False):
     """Évalue IFEval (instruction-following) sur le modèle déjà chargé, via
     lm-evaluation-harness. Import différé : lm_eval reste optionnel tant
-    qu'on ne passe pas --ifeval."""
+    qu'on ne passe pas --ifeval.
+
+    apply_chat_template : les prompts IFEval sont bruts par défaut. À activer
+    pour un modèle -Instruct ou finetuné au format chat, sinon il est hors
+    distribution et le score s'effondre."""
     import logging
 
     from lm_eval import simple_evaluate
@@ -217,7 +221,13 @@ def run_ifeval(model, tok, limit=None, batch_size=4):
 
     logging.getLogger("lm-eval").setLevel(logging.WARNING)
     lm = HFLM(pretrained=model, tokenizer=tok, batch_size=batch_size)
-    out = simple_evaluate(model=lm, tasks=["ifeval"], limit=limit, bootstrap_iters=0)
+    out = simple_evaluate(
+        model=lm,
+        tasks=["ifeval"],
+        limit=limit,
+        apply_chat_template=apply_chat_template,
+        bootstrap_iters=0,
+    )
     return out["results"]["ifeval"]
 
 
@@ -314,6 +324,7 @@ def run_variant(
     ifeval=False,
     ifeval_limit=None,
     ifeval_batch_size=4,
+    ifeval_chat_template=False,
     measure_energy=True,
     energy_gpu_index=0,
     energy_dir=None,
@@ -430,6 +441,7 @@ def run_variant_subprocess(
     ifeval=False,
     ifeval_limit=None,
     ifeval_batch_size=4,
+    ifeval_chat_template=False,
     measure_energy=True,
     energy_out=None,
 ):
@@ -454,6 +466,8 @@ def run_variant_subprocess(
         if ifeval_limit is not None:
             cmd += ["--ifeval-limit", str(ifeval_limit)]
         cmd += ["--ifeval-batch-size", str(ifeval_batch_size)]
+        if ifeval_chat_template:
+            cmd.append("--ifeval-chat-template")
     if not measure_energy:
         cmd.append("--no-energy")
     if energy_out:
@@ -499,6 +513,7 @@ def run_parallel(
     ifeval=False,
     ifeval_limit=None,
     ifeval_batch_size=4,
+    ifeval_chat_template=False,
     measure_energy=True,
     energy_out=None,
 ):
@@ -523,6 +538,7 @@ def run_parallel(
                 ifeval=ifeval,
                 ifeval_limit=ifeval_limit,
                 ifeval_batch_size=ifeval_batch_size,
+                ifeval_chat_template=ifeval_chat_template,
                 measure_energy=measure_energy,
                 energy_out=energy_out,
             )
@@ -698,6 +714,7 @@ def main():
             ifeval=args.ifeval,
             ifeval_limit=args.ifeval_limit,
             ifeval_batch_size=args.ifeval_batch_size,
+            ifeval_chat_template=args.ifeval_chat_template,
             measure_energy=args.measure_energy,
             energy_gpu_index=args.energy_gpu_index if args.energy_gpu_index is not None else 0,
             energy_dir=Path(args.energy_out) / args.worker_variant if args.energy_out else None,
@@ -734,6 +751,7 @@ def main():
                 ifeval=args.ifeval,
                 ifeval_limit=args.ifeval_limit,
                 ifeval_batch_size=args.ifeval_batch_size,
+                ifeval_chat_template=args.ifeval_chat_template,
                 measure_energy=args.measure_energy,
                 energy_out=args.energy_out,
             )
@@ -762,6 +780,7 @@ def main():
                 ifeval=args.ifeval,
                 ifeval_limit=args.ifeval_limit,
                 ifeval_batch_size=args.ifeval_batch_size,
+                ifeval_chat_template=args.ifeval_chat_template,
                 measure_energy=args.measure_energy,
                 energy_gpu_index=seq_energy_gpu_index,
                 energy_dir=Path(args.energy_out) / v if args.energy_out else None,
