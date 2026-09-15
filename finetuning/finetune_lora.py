@@ -202,13 +202,22 @@ def load_base_model(model_name):
 
     kwargs = dict(dtype="auto", device_map={"": 0})
     if method == "gptq":
-        # Les kernels exllama sont optimisés pour l'inférence et n'implémentent
-        # pas la passe arrière : il faut les désactiver pour entraîner un LoRA
-        # par-dessus. On réinjecte les bits lus dans le repo pour ne pas
-        # écraser la configuration d'origine.
+        # La plupart des kernels GPTQ (exllama, Marlin) sont optimisés pour
+        # l'inférence et n'implémentent PAS la passe arrière : Marlin lève
+        # explicitement `NotImplementedError: ... switching to training mode`.
+        # `backend="auto_trainable"` restreint la sélection aux kernels qui
+        # savent rétropropager. use_exllama=False est conservé comme garde-fou
+        # pour les piles plus anciennes qui ignorent `backend`.
         from transformers import GPTQConfig
 
-        kwargs["quantization_config"] = GPTQConfig(bits=quant.get("bits", 8), use_exllama=False)
+        bits = quant.get("bits", 8)
+        try:
+            gptq_cfg = GPTQConfig(bits=bits, use_exllama=False, backend="auto_trainable")
+        except TypeError:
+            # GPTQConfig trop ancien pour `backend` : on fait au mieux.
+            print("ATTENTION : GPTQConfig sans paramètre `backend` — kernel non garanti entraînable.")
+            gptq_cfg = GPTQConfig(bits=bits, use_exllama=False)
+        kwargs["quantization_config"] = gptq_cfg
 
     return AutoModelForCausalLM.from_pretrained(model_name, **kwargs)
 
