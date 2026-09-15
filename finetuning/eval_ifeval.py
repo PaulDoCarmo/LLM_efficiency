@@ -28,7 +28,7 @@ from pathlib import Path
 os.environ.setdefault("CUDA_DEVICE_ORDER", "PCI_BUS_ID")
 
 import torch
-from transformers import AutoModelForCausalLM, AutoTokenizer, BitsAndBytesConfig
+from transformers import AutoConfig, AutoModelForCausalLM, AutoTokenizer, BitsAndBytesConfig
 
 # Monitoring partagé avec benchmark.py : importé, pas recopié.
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
@@ -48,23 +48,49 @@ IFEVAL_METRICS = [
 ]
 
 
+def prequantized_method(model_name):
+    """Méthode de quantification déjà inscrite dans le repo (GPTQ, AWQ), ou None.
+
+    Un tel checkpoint porte sa propre `quantization_config` : lui passer un
+    BitsAndBytesConfig lève une ValueError ("The model is quantized with
+    GPTQConfig but you are passing a BitsAndBytesConfig").
+    """
+    quant = getattr(AutoConfig.from_pretrained(model_name), "quantization_config", None)
+    if quant is None:
+        return None
+    return (quant if isinstance(quant, dict) else quant.to_dict()).get("quant_method")
+
+
 def load_model(model_name, adapter, four_bit):
-    quant_cfg = (
-        BitsAndBytesConfig(
-            load_in_4bit=True,
-            bnb_4bit_quant_type="nf4",
-            bnb_4bit_compute_dtype=torch.bfloat16,
-            bnb_4bit_use_double_quant=True,
+    method = prequantized_method(model_name)
+
+    if method is not None:
+        # Déjà quantifié sur disque : on charge tel quel. Contrairement à
+        # l'entraînement, aucune contrainte de kernel ici — l'inférence peut
+        # utiliser les kernels rapides (Marlin, exllama), qui n'ont besoin que
+        # de la passe avant.
+        print(f"base : checkpoint déjà quantifié ({method}) -> chargé tel quel")
+        model = AutoModelForCausalLM.from_pretrained(
+            model_name, dtype="auto", device_map={"": 0}
         )
-        if four_bit
-        else None
-    )
-    model = AutoModelForCausalLM.from_pretrained(
-        model_name,
-        quantization_config=quant_cfg,
-        dtype=torch.bfloat16,
-        device_map={"": 0},
-    )
+    else:
+        quant_cfg = (
+            BitsAndBytesConfig(
+                load_in_4bit=True,
+                bnb_4bit_quant_type="nf4",
+                bnb_4bit_compute_dtype=torch.bfloat16,
+                bnb_4bit_use_double_quant=True,
+            )
+            if four_bit
+            else None
+        )
+        model = AutoModelForCausalLM.from_pretrained(
+            model_name,
+            quantization_config=quant_cfg,
+            dtype=torch.bfloat16,
+            device_map={"": 0},
+        )
+
     if adapter:
         from peft import PeftModel
 
