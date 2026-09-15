@@ -8,6 +8,8 @@ bitsandbytes>=0.43
 lm-eval[ifeval]>=0.4.4
 numpy
 pandas
-auto-gptq>=0.7  # variantes gptq-int8/gptq-int4 (checkpoints pré-quantifiés)
+optimum>=1.20    # pont transformers <-> backends de quantification (requis par GPTQ)
+gptqmodel>=1.0   # backend GPTQ (successeur d'auto-gptq, seul supporté par optimum
+                 # récent : sans lui, optimum plante sur NameError QuantizeConfig)
 autoawq>=0.2    # variante awq (checkpoint pré-quantifié)
 peft>=0.13
