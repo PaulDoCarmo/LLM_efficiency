@@ -69,8 +69,33 @@ from resnet50_eval_lib import (  # noqa: E402
     build_val_dataset,
     evaluate,
     init_gpu,
+    preload_tensors,
     print_validity_check,
 )
+
+
+class _PreloadedDataset:
+    """Vue en memoire (tenseurs deja decodes/transformes) d'un ImageNetValCSV.
+
+    evaluate() appelle preload_tensors(dataset) a CHAQUE repeat et a chaque
+    appel (baseline/pruned, par batch size) quand --preload est actif ; sur
+    resnet50_eval_lib.ImageNetValCSV, __getitem__ relit et redecode le JPEG
+    depuis le disque, en mono-thread (pas de DataLoader/workers). Sur 50000
+    images, appele 12 fois (2 modeles x 2 batch sizes x repeats=3) dans ce
+    script, ca reviendrait a redecoder 600000 JPEG en serie. En enveloppant
+    les tenseurs deja precalcules UNE fois, chaque preload_tensors() ulterieur
+    ne fait plus que de la reindexation/un stack de tenseurs deja en RAM."""
+
+    def __init__(self, tensors: "torch.Tensor", labels: "torch.Tensor", transform) -> None:
+        self.tensors = tensors
+        self.labels = labels
+        self.transform = transform
+
+    def __len__(self) -> int:
+        return self.tensors.size(0)
+
+    def __getitem__(self, idx: int):
+        return self.tensors[idx], self.labels[idx]
 
 
 def main() -> None:
@@ -88,6 +113,14 @@ def main() -> None:
     print(f"{len(class_to_idx)} classes indexees depuis {data_root / 'train'} (ordre trie des synsets)")
 
     val_dataset = build_val_dataset(data_root, args.val_csv, class_to_idx, eval_transform, n_images=0)
+
+    if args.preload:
+        print("Prechargement UNIQUE des 50000 images en tenseurs (evite de redecoder "
+              "les JPEG a chaque repeat/appel a evaluate())...")
+        tensors, labels = preload_tensors(val_dataset)
+        eval_dataset = _PreloadedDataset(tensors, labels, eval_transform)
+    else:
+        eval_dataset = val_dataset
 
     baseline_model = resnet50(weights=weights).to(device).eval()
 
@@ -113,16 +146,16 @@ def main() -> None:
     ts = time.strftime("%Y%m%dT%H%M%S")
 
     for bs in batch_sizes:
-        print(f"=== Evaluation sur les {len(val_dataset)} images du val set, batch-size={bs} ===")
+        print(f"=== Evaluation sur les {len(eval_dataset)} images du val set, batch-size={bs} ===")
         eval_args = copy.copy(args)
         eval_args.batch_size = bs
 
         print(f"--- Baseline (modele pre-entraine intact) ---")
-        baseline_results = evaluate(baseline_model, device, handle, gpu_name, val_dataset, eval_args)
+        baseline_results = evaluate(baseline_model, device, handle, gpu_name, eval_dataset, eval_args)
         print_validity_check(baseline_results["top1_acc"], args.weights)
 
         print(f"--- Pruned+finetune (checkpoint) ---")
-        pruned_results = evaluate(pruned_model, device, handle, gpu_name, val_dataset, eval_args)
+        pruned_results = evaluate(pruned_model, device, handle, gpu_name, eval_dataset, eval_args)
 
         energy_reduction_pct = (1 - pruned_results["energy_j_mean"] / baseline_results["energy_j_mean"]) * 100.0
         report = {
